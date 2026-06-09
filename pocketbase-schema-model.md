@@ -95,10 +95,11 @@ ID 自动生成规则：`"pbc_" + crc32(Type + Name)`，冲突时追加数字后
 | `ValidateSettings(ctx, app, collection) error` | Schema 定义时的字段配置校验 |
 
 扩展接口：
-- `MultiValuer` — 是否支持多值（MaxSelect > 1）
+- `MultiValuer` — 是否支持多值（通过 `MaxSelect > 1` 判断，仅 3 种字段实现）
 - `DriverValuer` — 导出数据库存储值
 - `SetterFinder` / `GetterFinder` — 自定义字段访问器（支持 `field+`, `:autogenerate` 等修饰符）
 - `RecordInterceptor` — 拦截 Record 的 CRUD 生命周期
+- `MaxBodySizeCalculator` — 计算字段值最大请求体大小
 
 ### 2.2 字段注册表
 
@@ -113,24 +114,32 @@ func init() {
 }
 ```
 
-### 2.3 全部 15 种字段类型与 SQLite 列映射
+### 2.3 全部 14 种字段类型与 SQLite 列映射
 
-| 字段类型 | Go 结构体 | SQLite 列类型 | 默认值 |
-|----------|-----------|--------------|--------|
-| text | `TextField` | TEXT | `''`（PK 时为 `'r'||lower(hex(randomblob(7)))`） |
-| number | `NumberField` | NUMERIC | `0` |
-| bool | `BoolField` | BOOLEAN | `FALSE` |
-| email | `EmailField` | TEXT | `''` |
-| url | `URLField` | TEXT | `''` |
-| date | `DateField` | TEXT | `''` |
-| autodate | `AutodateField` | TEXT | `''` |
-| editor | `EditorField` | TEXT | `''` |
-| password | `PasswordField` | TEXT | `''` |
-| json | `JSONField` | JSON | `NULL` |
-| geo_point | `GeoPointField` | JSON | `'{"lon":0,"lat":0}'` |
-| select | `SelectField` | TEXT 或 JSON | `''` 或 `'[]'`（多值） |
-| relation | `RelationField` | TEXT 或 JSON | `''` 或 `'[]'`（多值） |
-| file | `FileField` | TEXT 或 JSON | `''` 或 `'[]'`（多文件） |
+根据 `Grep` 核对 `Fields[...]` 注册语句，共 **14 种** 字段类型（不是 15 种）：
+
+| 字段类型常量值 | Go 结构体 | SQLite 列类型 | 默认值 | MultiValuer |
+|----------------|-----------|--------------|--------|-------------|
+| `text` | `TextField` | TEXT | `''`（PK 时为 `'r'||lower(hex(randomblob(7)))`） | 否 |
+| `number` | `NumberField` | NUMERIC | `0` | 否 |
+| `bool` | `BoolField` | BOOLEAN | `FALSE` | 否 |
+| `email` | `EmailField` | TEXT | `''` | 否 |
+| `url` | `URLField` | TEXT | `''` | 否 |
+| `date` | `DateField` | TEXT | `''` | 否 |
+| `autodate` | `AutodateField` | TEXT | `''` | 否 |
+| `editor` | `EditorField` | TEXT | `''` | 否 |
+| `password` | `PasswordField` | TEXT | `''` | 否 |
+| `json` | `JSONField` | JSON | `NULL` | 否 |
+| `geoPoint` | `GeoPointField` | JSON | `'{"lon":0,"lat":0}'` | 否 |
+| `select` | `SelectField` | TEXT 或 JSON | `''` 或 `'[]'`（MaxSelect>1 时） | **是** |
+| `relation` | `RelationField` | TEXT 或 JSON | `''` 或 `'[]'`（MaxSelect>1 时） | **是** |
+| `file` | `FileField` | TEXT 或 JSON | `''` 或 `'[]'`（MaxSelect>1 时） | **是** |
+
+**核对依据**：
+- 14 个 `Fields[...]` 注册语句，参见各 `field_*.go` 的 `init()` 函数
+- 仅 3 个字段声明实现 `MultiValuer`：[field_select.go L23](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/field_select.go#L23)、[field_relation.go L23](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/field_relation.go#L23)、[field_file.go L39](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/field_file.go#L39)
+- `geoPoint` 类型名是驼峰（常量 `FieldTypeGeoPoint = "geoPoint"`），不是下划线分隔
+- `GeoPointField.ColumnType()` 返回 ``JSON DEFAULT '{"lon":0,"lat":0}' NOT NULL``，lon 在前、lat 在后
 
 多值切换规则在 [collection_record_table_sync.go L155-L298](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/collection_record_table_sync.go#L155-L298) 中处理（见第四节）。
 
@@ -220,20 +229,64 @@ createCollectionIndexes(txApp, newCollection)
 7. **创建新索引**：`createCollectionIndexes()`
 8. **优化**：事务外执行 `PRAGMA optimize`
 
-### 4.3 单值 ↔ 多值 数据迁移
+### 4.3 单值 ↔ 多值 数据迁移（normalizeSingleVsMultipleFieldChanges）
 
 [collection_record_table_sync.go L155-L298](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/collection_record_table_sync.go#L155-L298)
 
-这是最复杂的 Schema 变更场景（如 Select/Relation/File 字段的 MaxSelect 从 1 改 >1 或反向），执行步骤：
+**触发条件**：仅对实现了 `MultiValuer` 接口的 3 种字段（Select/Relation/File）生效，当 `oldField.MaxSelect > 1` 与 `newField.MaxSelect > 1` 结果不同时触发。即：
+- 单→多：MaxSelect 从 ≤1 改为 >1（列类型从 TEXT → JSON）
+- 多→单：MaxSelect 从 >1 改为 ≤1（列类型从 JSON → TEXT）
 
-1. **临时删除所有视图**：避免列改名时的外键引用错误（SQLite 不支持直接修改列类型）
-2. **列改名**：原列名 → `_原名+随机5字符`
-3. **新建列**：用新类型（TEXT ↔ JSON）重新 AddColumn
-4. **数据转换**：
-   - **单→多**：空值→`'[]'`；已是 JSON 数组→原值；其他→`json_array(value)`
-   - **多→单**：空数组→`''`；JSON 数组→取最后一个元素 `json_extract(col, '$[#-1]')`；其他→原值
-5. **删除旧列**：`DropColumn` 临时列
-6. **恢复视图**：重新执行所有 CREATE VIEW 语句
+**执行步骤（逐字段处理，每个字段独立完成以下流程）**：
+
+1. **临时删除所有视图**（L184-L203）：从 `sqlite_master` 查出所有 CREATE VIEW 语句并保存，然后逐个 `DeleteView`，避免后续列改名时的引用约束错误（作为 `writable_schema` PRAGMA 的替代方案）
+
+2. **列改名**（L205-L212）：原列名 `originalName` → `oldTempName = "_" + originalName + 随机5字符`
+
+3. **新建列**（L214-L218）：用 `newField.ColumnType(app)` 在 `originalName` 位置重新 AddColumn
+   - 单→多：列类型从 `TEXT DEFAULT '' NOT NULL` 变为 `JSON DEFAULT '[]' NOT NULL`
+   - 多→单：列类型从 `JSON DEFAULT '[]' NOT NULL` 变为 `TEXT DEFAULT '' NOT NULL`
+
+4. **数据转换 SQL**（L220-L273）：
+
+   **单→多（L222-L245）**：
+   ```sql
+   UPDATE {table} set {newCol} = (
+       CASE
+           WHEN COALESCE({oldTempCol}, '') = ''
+           THEN '[]'                                    -- 空值或 NULL → 空数组
+           ELSE (
+               CASE
+                   WHEN json_valid({oldTempCol}) AND json_type({oldTempCol}) == 'array'
+                   THEN {oldTempCol}                       -- 已经是合法 JSON 数组 → 原值
+                   ELSE json_array({oldTempCol})            -- 其他 → 包装成单元素数组
+               END
+           )
+       END
+   )
+   ```
+
+   **多→单（L246-L273）**：
+   ```sql
+   UPDATE {table} set {newCol} = (
+       CASE
+           WHEN COALESCE({oldTempCol}, '[]') = '[]'
+           THEN ''                                        -- 空数组或 NULL → 空字符串
+           ELSE (
+               CASE
+                   WHEN json_valid({oldTempCol}) AND json_type({oldTempCol}) == 'array'
+                   THEN COALESCE(json_extract({oldTempCol}, '$[#-1]'), '')  -- 取最后一个元素
+                   ELSE {oldTempCol}                       -- 非数组 → 原值
+               END
+           )
+       END
+   )
+   ```
+   注意：多→单时，FileField 的实际文件对象不会被删除，需通过自定义迁移手动处理。
+
+5. **删除旧列**（L281-L285）：`DropColumn(oldTempName)`
+
+6. **恢复视图**（L287-L293）：重新执行步骤 1 保存的所有 CREATE VIEW SQL
 
 ### 4.4 删除集合
 
@@ -386,17 +439,20 @@ Automigrate 插件（如启用）: 生成迁移代码文件
 
 1. **Field ID 作为稳定标识**：字段改名通过 ID 匹配识别，而不是 Name，避免数据丢失。这也是 `FieldsList.add()` 中无 ID 时按 Name 匹配并复用原 ID 的原因。
 
-2. **临时列名策略**：列新增/改名采用"临时名→真名"两步法，处理 `A↔B` 互换等冲突场景。
+2. **临时列名策略**：列新增/改名采用"临时名→真名"两步法，处理 `A↔B` 互换等冲突场景。单值/多值切换时临时列名前缀为 `_` + 原名。
 
 3. **SQLite 功能规避**：
    - 不直接 ALTER COLUMN 类型，而是 "改名旧列→建新列→数据转换→删旧列"
    - 修改列时临时删除所有视图，完成后恢复
+   - 视图删除/恢复是逐字段执行的（每次处理一个 MultiValuer 字段变更都会循环一次）
 
-4. **Hook 分层执行**：
+4. **MultiValuer 仅 3 种字段**：SelectField、RelationField、FileField 通过 `MaxSelect > 1` 判断是否多值。其他字段（包括 json、geoPoint）不支持单/多值切换。
+
+5. **Hook 分层执行**：
    - Priority < 0：用户自定义 Hook 先执行
    - Priority > 0（99）：系统 Hook 后执行，确保验证/同步在用户逻辑之后
    - SaveExecute 在 Priority 99（最靠近 DB），最小化事务锁时间
 
-5. **索引容错**：验证阶段不检查表名（`TableName = "validator"`），实际创建时强制覆盖为当前集合名，允许部分修改集合名时索引定义不更新。
+6. **索引容错**：验证阶段不检查表名（`TableName = "validator"`），实际创建时强制覆盖为当前集合名，允许部分修改集合名时索引定义不更新。
 
-6. **双重缓存**：`ReloadCachedCollections()` 在成功和失败时都触发，失败时回滚到之前的缓存状态。
+7. **双重缓存**：`ReloadCachedCollections()` 在成功和失败时都触发，失败时回滚到之前的缓存状态。
