@@ -254,34 +254,57 @@ createCollectionIndexes(txApp, newCollection)
    UPDATE {table} set {newCol} = (
        CASE
            WHEN COALESCE({oldTempCol}, '') = ''
-           THEN '[]'                                    -- 空值或 NULL → 空数组
+           THEN '[]'
            ELSE (
                CASE
                    WHEN json_valid({oldTempCol}) AND json_type({oldTempCol}) == 'array'
-                   THEN {oldTempCol}                       -- 已经是合法 JSON 数组 → 原值
-                   ELSE json_array({oldTempCol})            -- 其他 → 包装成单元素数组
+                   THEN {oldTempCol}
+                   ELSE json_array({oldTempCol})
                END
            )
        END
    )
    ```
 
+   **单→多 CASE 分支精确命中表**：
+
+   | oldTempCol 值 | COALESCE(col, '') = '' | 命中分支 | 结果值 |
+   |---------------|----------------------|---------|--------|
+   | `NULL` | `'' = ''` → **TRUE** | 外层 WHEN 1 | `'[]'` |
+   | `''` (空字符串) | `'' = ''` → **TRUE** | 外层 WHEN 1 | `'[]'` |
+   | `'[]'` (JSON 空数组) | `'[]' = ''` → **FALSE** | 进入 ELSE → json_valid('[]')=TRUE ∧ json_type='array' → **TRUE** | 原值 `'[]'` |
+   | `'["admin"]'` (JSON 非空数组) | `'["admin"]' = ''` → **FALSE** | 进入 ELSE → 内层 WHEN 命中 | 原值 `'["admin"]'` |
+   | `'admin'` (普通字符串) | `'admin' = ''` → **FALSE** | 进入 ELSE → json_valid('admin')=FALSE → 内层 ELSE | `json_array('admin')` → `'["admin"]'` |
+   | `'123'` (数字字符串) | `'123' = ''` → **FALSE** | 进入 ELSE → json_valid('123')=TRUE 但 json_type='integer' → 内层 ELSE | `json_array('123')` → `'["123"]'` |
+
    **多→单（L246-L273）**：
    ```sql
    UPDATE {table} set {newCol} = (
        CASE
            WHEN COALESCE({oldTempCol}, '[]') = '[]'
-           THEN ''                                        -- 空数组或 NULL → 空字符串
+           THEN ''
            ELSE (
                CASE
                    WHEN json_valid({oldTempCol}) AND json_type({oldTempCol}) == 'array'
-                   THEN COALESCE(json_extract({oldTempCol}, '$[#-1]'), '')  -- 取最后一个元素
-                   ELSE {oldTempCol}                       -- 非数组 → 原值
+                   THEN COALESCE(json_extract({oldTempCol}, '$[#-1]'), '')
+                   ELSE {oldTempCol}
                END
            )
        END
    )
    ```
+
+   **多→单 CASE 分支精确命中表**：
+
+   | oldTempCol 值 | COALESCE(col, '[]') = '[]' | 命中分支 | 结果值 |
+   |---------------|---------------------------|---------|--------|
+   | `NULL` | `'[]' = '[]'` → **TRUE** | 外层 WHEN 1 | `''` |
+   | `'[]'` (JSON 空数组) | `'[]' = '[]'` → **TRUE** | 外层 WHEN 1 | `''` |
+   | `'["admin"]'` (JSON 单元素数组) | `'["admin"]' = '[]'` → **FALSE** | 进入 ELSE → json_valid=TRUE ∧ json_type='array' → json_extract('$[#-1]') = `'admin'` | `'admin'` |
+   | `'["admin","user"]'` (多元素数组) | 非 '[]' → **FALSE** | 进入 ELSE → 取 `$[#-1]` 最后一个元素 | `'user'` |
+   | `'admin'` (普通字符串) | `'admin' = '[]'` → **FALSE** | 进入 ELSE → json_valid('admin')=FALSE → 内层 ELSE | 原值 `'admin'` |
+   | `'[]'`(非 JSON，恰好是文本) | `'[]' = '[]'` → **TRUE** | 外层 WHEN 1 | `''` |
+
    注意：多→单时，FileField 的实际文件对象不会被删除，需通过自定义迁移手动处理。
 
 5. **删除旧列**（L281-L285）：`DropColumn(oldTempName)`
@@ -369,12 +392,15 @@ SyncRecordTableSchema:
        1. 删视图
        2. RenameColumn: "tags" → "_tagsYyyYy" (第二次改名)
        3. AddColumn: "tags" JSON DEFAULT '[]' NOT NULL (第二次加列)
-       4. UPDATE: 所有行 '_tagsYyyYy' 的值是 '[]' → COALESCE('', '') = '' → 结果仍为 '[]'
+       4. UPDATE: 所有行 '_tagsYyyYy' 的值是 '[]'
+            → COALESCE('[]', '') = '[]' ≠ '' → 外层 WHEN 不命中，进入 ELSE
+            → json_valid('[]') = TRUE, json_type('[]') = 'array' → 内层 WHEN 命中
+            → 返回原值 '[]' (通过"已是 JSON 数组"分支保持原值)
        5. DropColumn: "_tagsYyyYy"
        6. 恢复视图
 ```
 
-**结果**：阶段 B-C 已经创建了正确的 JSON 列并填充了 `'[]'`，阶段 D 又做了一次 rename→add→等幂 UPDATE→drop。整个过程是**等幂的无副作用操作**，但消耗了额外的性能（视图删/恢复、三次列操作）。
+**结果**：阶段 B-C 已经创建了正确的 JSON 列并填充了 `'[]'`，阶段 D 又做了一次 rename→add→等幂 UPDATE→drop。等幂性并非来自外层空值匹配，而是 `'[]'` 作为合法 JSON 空数组命中了内层 `json_type='array'` 分支保持原值。整个过程是**等幂的无副作用操作**，但消耗了额外的性能（视图删/恢复、三次列操作）。
 
 ---
 
@@ -696,7 +722,7 @@ Automigrate 插件（如启用）: 生成迁移代码文件
 
 7. **双重缓存**：`ReloadCachedCollections()` 在成功和失败时都触发，失败时回滚到之前的缓存状态。
 
-8. **新增多值字段的等幂转换**：即使 oldCollection 中不存在该字段定义（`oldField == nil`），如果新字段是多值，仍然会进入完整的"单→多"转换流程。常规路径下这是一次等幂操作（阶段 B-C 已用 `JSON DEFAULT '[]'` 建列，阶段 D 又做一次 rename→add→UPDATE `'[]'`→`'[]'`→drop）。注意：SQLite 表中若已存在真实列名，会在阶段 C 的 `RenameColumn(临时名→真名)` 因 "duplicate column name" 失败并回滚，normalize 中的防御性代码不会被触发。
+8. **新增多值字段的等幂转换**：即使 oldCollection 中不存在该字段定义（`oldField == nil`），如果新字段是多值，仍然会进入完整的"单→多"转换流程。常规路径下这是一次等幂操作：阶段 B-C 已用 `JSON DEFAULT '[]'` 建列，阶段 D 的等幂 UPDATE 中，`'[]'` 作为合法 JSON 空数组，外层 `COALESCE('[]', '') = '[]' ≠ ''` 不命中空值分支，进入内层后 `json_valid('[]') ∧ json_type='array'` 命中"已是数组"分支保持原值。注意：SQLite 表中若已存在真实列名，会在阶段 C 的 `RenameColumn(临时名→真名)` 因 "duplicate column name" 失败并回滚，normalize 中的防御性代码不会被触发。
 
 9. **视图恢复的直接执行策略**：视图恢复时直接执行保存的原始 `CREATE VIEW` SQL，不经过 `SaveView()` 的 `SELECT * FROM (query)` 包裹和 `TableInfo` 校验。前提是视图由 PocketBase 合法创建，定义已在保存前验证过。
 
