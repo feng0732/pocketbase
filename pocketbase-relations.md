@@ -186,27 +186,48 @@ if total != len(ids) {
 
 ## 四、删除记录时级联规则的影响处理
 
-### 4.1 删除流程总览
+### 4.1 onRecordDeleteExecute：事务边界划分
 
-```
-recordDelete (API Handler)
-  └─► e.App.Delete(record)
-        └─► app.DeleteWithContext
-              └─► OnModelDelete Hook
-                    └─► OnRecordDelete Hook
-                          └─► callFieldInterceptors(InterceptorActionDelete)
-              └─► OnModelDeleteExecute Hook
-                    └─► OnRecordDeleteExecute Hook
-                          └─► callFieldInterceptors(InterceptorActionDeleteExecute)
-                                └─► onRecordDeleteExecute   // ★ 级联核心
-                                      ├─► FindCachedCollectionReferences  // 查找反向引用
-                                      ├─► RunInTransaction
-                                      │     ├─► e.Next()  // 先删除当前记录（防死锁）
-                                      │     └─► cascadeRecordDelete       // ★ 处理级联
-                                      │           └─► deleteRefRecords     // 处理每条引用
+位于 [record_model.go#L1476-L1501](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/record_model.go#L1476-L1501)，这是级联删除的入口函数，也是事务边界的关键划分点：
+
+```go
+func onRecordDeleteExecute(e *RecordEvent) error {
+    // ====== 事务外：只查集合Schema引用（不查数据） ======
+    // note: the select is outside of the transaction to minimize
+    // SQLITE_BUSY errors when mixing read&write in a single transaction
+    refs, err := e.App.FindCachedCollectionReferences(e.Record.Collection())
+    if err != nil {
+        return err
+    }
+
+    originalApp := e.App
+    // ====== 进入事务：所有数据读写都在这里 ======
+    txErr := e.App.RunInTransaction(func(txApp App) error {
+        e.App = txApp
+
+        // 先删除主记录，再处理引用（防止 A<->B 互指导致递归死锁）
+        if err := e.Next(); err != nil {
+            return err
+        }
+
+        return cascadeRecordDelete(txApp, e.Record, refs)
+    })
+    e.App = originalApp
+
+    return txErr
+}
 ```
 
-### 4.2 查找反向引用（FindCachedCollectionReferences）
+**事务边界要点**：
+
+| 阶段 | 位置 | 做什么 | 为什么放事务外 |
+|------|------|--------|----------------|
+| 事务外 | `FindCachedCollectionReferences` | 从缓存里遍历所有集合Schema，找出**哪些集合的哪些 RelationField 字段定义**指向了被删记录所在的集合（返回 `map[*Collection][]Field`） | 只读缓存不涉及DB，避免SQLite同一事务内读写混合触发 SQLITE_BUSY |
+| 事务内 | `e.Next()` + `cascadeRecordDelete` | 真正删除主记录、查询具体引用记录、处理级联逻辑 | 需要原子性：要么主记录和所有级联都成功，要么全部回滚 |
+
+> 这里非常容易混淆：**事务外拿到的是「字段定义引用」，不是「引用记录」**。具体哪些记录引用了当前被删记录，是在事务内部通过 `cascadeRecordDelete` 里的 `app.RecordQuery(refCollection)` 去数据库查的。
+
+### 4.2 事务外：FindCachedCollectionReferences
 
 位于 [collection_query.go#L165-L188](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/collection_query.go#L165-L188)：
 
@@ -218,8 +239,8 @@ func (app *BaseApp) FindCachedCollectionReferences(collection *Collection, exclu
         if slices.Contains(excludeIds, c.Id) { continue }
         for _, rawField := range c.Fields {
             f, ok := rawField.(*RelationField)
-            if ok && f.CollectionId == collection.Id {  // 找到所有指向当前集合的RelationField
-                result[c] = append(result[c], f)
+            if ok && f.CollectionId == collection.Id {  // 匹配字段定义上的CollectionId
+                result[c] = append(result[c], f)         // 收集的是Field对象，不是记录
             }
         }
     }
@@ -227,24 +248,52 @@ func (app *BaseApp) FindCachedCollectionReferences(collection *Collection, exclu
 }
 ```
 
-返回值 `map[*Collection][]Field` 的含义是：**哪些集合的哪些字段引用了当前被删除记录所在的集合**。
+返回值 `map[*Collection][]Field` 的含义：**Schema层面——哪些集合的哪些 RelationField 字段定义指向了当前集合**。这只是告诉 cascadeRecordDelete "去哪些集合的哪些字段里查引用记录"，本身不返回任何数据记录。
 
-### 4.3 级联删除核心（cascadeRecordDelete）
+### 4.3 事务内：cascadeRecordDelete
 
-位于 [record_model.go#L1506-L1574](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/record_model.go#L1506-L1574)：
+位于 [record_model.go#L1506-L1574](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/record_model.go#L1506-L1574)，这里做两件重要的过滤：**跳过视图集合** 和 **排除自引用场景下的被删记录自身**。
 
-**设计要点**：
-- 在事务外先查询引用（避免 SQLITE_BUSY 读写冲突）
-- 先删除主记录，再处理引用（防止 A↔B 互相引用导致死锁）
-- 按集合名称排序保证处理顺序确定性
+#### 4.3.1 跳过视图集合
 
-**查询引用记录的逻辑**：
+```go
+for _, refCollection := range sortedRefKeys {
+    fields, ok := refs[refCollection]
+    if !ok || refCollection.IsView() {
+        continue // skip missing or view collections
+    }
+```
+
+**为什么要跳过视图**：视图集合（View Collection）本质是一条 SQL `SELECT` 查询映射出来的虚拟表，不存储自己的数据记录，底层没有可操作的物理表。引用字段如果在视图里，指向关系的完整性由底层查询保证，不需要也不能对视图做 UPDATE/DELETE，所以直接跳过。
+
+#### 4.3.2 同集合自引用排除被删记录自身
+
+```go
+query := app.RecordQuery(refCollection)
+
+// ...（单选/多选查询条件）...
+
+if refCollection.Id == mainRecord.Collection().Id {
+    query.AndWhere(dbx.Not(dbx.HashExp{recordTableName + ".id": mainRecord.Id}))
+}
+```
+
+**场景**：集合 `categories` 有个 `parent` 字段指向 `categories` 自身（树状分类）。现在删除分类A，而分类A的 `parent` 恰好指向自己。
+
+**为什么要排除自己**：
+1. 主记录（A）已经在 `e.Next()` 里从数据库删掉了
+2. 如果不加这个排除条件，查询引用记录时可能查到 A 自己（A.parent = A.id）
+3. 然后 `deleteRefRecords` 尝试把 A 从 A.parent 里移除 → 但 A 已经删了，对已删除记录的操作没有意义甚至会报错
+4. 所以当引用集合就是被删记录所在集合时（自引用场景），查询时用 `NOT id = mainRecord.Id` 把自己排除掉
+
+#### 4.3.3 真正的引用记录查询（在事务内）
+
 ```go
 if opt, ok := field.(MultiValuer); !ok || !opt.IsMultiple() {
-    // 单选关系：直接等值匹配
+    // 单选关系：字段值直接等于被删记录id
     query.AndWhere(dbx.HashExp{prefixedFieldName: mainRecord.Id})
 } else {
-    // 多选关系：用 JSON_EACH 拆解数组后匹配
+    // 多选关系：用 SQLite JSON_EACH 把JSON数组拆成多行再匹配
     query.AndWhere(dbx.Exists(dbx.NewExp(fmt.Sprintf(
         `SELECT 1 FROM %s {{__je__}} WHERE [[__je__.value]]={:jevalue}`,
         dbutils.JSONEach(prefixedFieldName),
@@ -252,9 +301,9 @@ if opt, ok := field.(MultiValuer); !ok || !opt.IsMultiple() {
 }
 ```
 
-批处理大小为 4000 条，循环处理直到无更多引用记录。
+查询结果按 4000 条一批分批取出，循环调用 `deleteRefRecords` 处理，直到无更多记录。
 
-### 4.4 引用记录处理（deleteRefRecords）
+### 4.4 deleteRefRecords：级联决策
 
 位于 [record_model.go#L1581-L1621](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/record_model.go#L1581-L1621)，这是级联规则的最终决策点：
 
@@ -263,7 +312,7 @@ func deleteRefRecords(app App, mainRecord *Record, refRecords []*Record, field F
     relField, _ := field.(*RelationField)
     
     for _, refRecord := range refRecords {
-        // 步骤1：从引用记录中移除被删除记录的ID
+        // 步骤1：从引用记录的字段值中移除被删记录的ID
         ids := refRecord.GetStringSlice(relField.Name)
         for i := len(ids) - 1; i >= 0; i-- {
             if ids[i] == mainRecord.Id {
@@ -272,22 +321,22 @@ func deleteRefRecords(app App, mainRecord *Record, refRecords []*Record, field F
             }
         }
 
-        // 步骤2：判断级联删除
+        // 步骤2：级联删除——只有当"移除后关系为空"且CascadeDelete为true时触发
         if relField.CascadeDelete && len(ids) == 0 {
-            if err := app.Delete(refRecord); err != nil {  // 递归删除
+            if err := app.Delete(refRecord); err != nil {  // 递归走完整的Delete流程
                 return err
             }
-            continue  // 引用记录已被删除，无需后续处理
+            continue
         }
 
-        // 步骤3：判断必填约束
+        // 步骤3：必填保护——如果关系为空且字段是Required，报错回滚
         if relField.Required && len(ids) == 0 {
             return fmt.Errorf(
                 "the record cannot be deleted because it is part of a required reference in record %s (%s collection)",
                 refRecord.Id, refRecord.Collection().Name)
         }
 
-        // 步骤4：普通情况——保存修改后的值（去除了被删除ID的引用）
+        // 步骤4：普通情况——更新引用记录（跳过校验，因为其他引用可能也已失效）
         refRecord.Set(relField.Name, ids)
         if err := app.SaveNoValidate(refRecord); err != nil {
             return err
@@ -297,18 +346,61 @@ func deleteRefRecords(app App, mainRecord *Record, refRecords []*Record, field F
 }
 ```
 
+> 注意步骤4用的是 `SaveNoValidate`：同一事务内可能已经删除了其他被引用的记录，如果再跑完整校验（ValidateValue 会去查所有关联记录是否存在）会因为引用已被删除而报错，所以这里跳过校验直接写库。
+
 ### 4.5 级联决策矩阵
 
-| 场景 | CascadeDelete | Required | 移除后ids为空 | 结果 |
-|------|---------------|----------|---------------|------|
-| 1 | true | 任意 | 是 | **级联删除**引用记录 |
-| 2 | false | true | 是 | **报错阻止删除**（必填关系被破坏） |
+| 场景 | CascadeDelete | Required | 移除被删ID后ids为空 | 结果 |
+|------|---------------|----------|---------------------|------|
+| 1 | true | 任意 | 是 | **递归级联删除**引用记录 |
+| 2 | false | true | 是 | **报错回滚**（必填关系被破坏，不允许删除） |
 | 3 | false | false | 是 | 清空引用字段，保存引用记录 |
-| 4 | 任意 | 任意 | 否（还有其他关联） | 仅移除当前ID，保存引用记录 |
+| 4 | 任意 | 任意 | 否（还有其他关联） | 仅从关系列表中移除当前ID，保存引用记录 |
 
-> **注意**：`CascadeDelete` 的语义是「当所有关联都没了就删自己」，而不是「删了关联就跟着删」。只有当移除被删ID后关系列表完全为空时才触发级联。
+> **CascadeDelete 语义澄清**：不是"关联的记录被删了我就跟着删"，而是**"当我的这个关系字段里所有的关联都没了时，我自己也没有存在的意义了，把我也删掉"**。这也是为什么只有 `len(ids) == 0` 时才触发——多选关系下如果还有其他关联记录，不触发级联。
 
-### 4.6 数据库表同步
+### 4.6 删除流程完整时序图
+
+```
+onRecordDeleteExecute
+  │
+  ├─ [事务外] FindCachedCollectionReferences
+  │     └─ 遍历缓存中的所有集合Schema
+  │     └─ 返回 map[*Collection][]Field（只是字段定义，不含记录）
+  │
+  └─ RunInTransaction ───────────────────────────────── 事务边界
+        │
+        ├─ e.Next() ──────────────────────────────── 先删主记录（防互指死锁）
+        │     └─ DELETE FROM mainTable WHERE id = ?
+        │
+        └─ cascadeRecordDelete(txApp, record, refs)
+              │
+              ├─ 按集合名排序遍历
+              │     │
+              │     ├─ refCollection.IsView() → continue  （跳过视图）
+              │     │
+              │     └─ 遍历每个引用字段
+              │           │
+              │           ├─ 构造 RecordQuery
+              │           │     ├─ 单选：WHERE field = record.Id
+              │           │     └─ 多选：WHERE JSON_EACH(field) CONTAINS record.Id
+              │           │
+              │           ├─ [自引用场景] refColId == mainColId
+              │           │     └─ AND NOT id = mainRecord.Id （排除自己）
+              │           │
+              │           ├─ 按4000条/批循环查询引用记录
+              │           │
+              │           └─ deleteRefRecords(app, mainRecord, batch, field)
+              │                 │
+              │                 ├─ 从ids里移除 mainRecord.Id
+              │                 ├─ CascadeDelete && 空 → app.Delete(递归)
+              │                 ├─ Required && 空 → return error
+              │                 └─ 其他情况 → SaveNoValidate 更新引用记录
+              │
+              └─ 所有引用集合处理完成 → return nil（提交事务）
+```
+
+### 4.7 数据库表同步
 
 [collection_record_table_sync.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/collection_record_table_sync.go) 负责集合结构变更时的表同步：
 
