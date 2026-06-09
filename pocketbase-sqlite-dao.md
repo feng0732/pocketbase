@@ -193,8 +193,11 @@ func (b *dualDBBuilder) NewQuery(str string) *dbx.Query {
 | `Save()` → `update()`（UPDATE） | NonconcurrentDB | [db.go#L385-L391](core/db.go#L385-L391) |
 | `Delete()`（DELETE） | NonconcurrentDB | [db.go#L124-L130](core/db.go#L124-L130) |
 | `validateRecordId()`（存在性检查 SELECT） | ConcurrentDB | [db.go#L487-L491](core/db.go#L487-L491) |
-| `HasTable() / TableInfo() / TableColumns()`（元数据查询） | ConcurrentDB | [db_table.go#L101-L107](core/db_table.go#L101-L107) |
-| `DeleteTable() / Vacuum()`（DDL / 维护操作） | NonconcurrentDB | [db_table.go#L90-L95](core/db_table.go#L90-L95) |
+| `TableColumns()`（列名查询） | ConcurrentDB | [db_table.go#L10-L19](core/db_table.go#L10-L19) |
+| `TableInfo()`（表结构查询） | ConcurrentDB | [db_table.go#L33-L51](core/db_table.go#L33-L51) |
+| `HasTable()`（表存在性检查） | ConcurrentDB | [db_table.go#L98-L102](core/db_table.go#L98-L102) |
+| `DeleteTable()`（删表 DDL） | NonconcurrentDB | [db_table.go#L83-L96](core/db_table.go#L83-L96) |
+| `Vacuum()`（空间回收） | NonconcurrentDB | [db_table.go#L123-L137](core/db_table.go#L123-L137) |
 
 ---
 
