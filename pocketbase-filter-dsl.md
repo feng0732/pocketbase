@@ -41,7 +41,7 @@ dbx.Expression
 
 使用第三方库 `github.com/ganigeorgiev/fexpr` 进行词法和语法分析，将 DSL 字符串解析为结构化的表达式组树（ExprGroup），支持：
 - 比较运算符：`=` `!=` `>` `<` `>=` `<=` `~` (LIKE) `!~` (NOT LIKE)
-- **any/optional 运算符**：`?=` `?!=` `?>` `?<` `?>=` `?<=` `?~` `?!~`
+- **any 运算符**（`?` 前缀）：`?=` `?!=` `?>` `?<` `?>=` `?<=` `?~` `?!~`。注意：`?` 前缀**不改变 SQL 比较符本身**，仅跳过多值关系的全称量化约束（详见 §3.1.1）。
 - 逻辑运算符：`&&` (AND) `||` (OR)
 - 括号分组、字面量、标识符、函数调用（`geoDistance()`、`strftime()`）
 
@@ -176,6 +176,45 @@ if !isAnyMatchOp(op) {           // 只有非 ? 运算符才进入
 ```
 
 `isAnyMatchOp` [tools/search/filter.go](./tools/search/filter.go#L450-L461) 对所有 `?` 前缀运算符返回 `true`，直接跳过 Multi-Match 附加逻辑。
+
+#### 3.1.1 `?` 前缀不改变 SQL 比较符——只控制量化方式
+
+一个极易误解的关键点：**`?` 前缀运算符和对应标准运算符映射到完全相同的 SQL 比较符**。差异仅在于是否附加全称量化子查询。
+
+`buildResolversExpr` [tools/search/filter.go](./tools/search/filter.go#L176-L203) 的 switch 语句将两者合并处理：
+
+```go
+case fexpr.SignEq, fexpr.SignAnyEq:      // = 和 ?= 走同一条分支
+    expr = resolveEqualExpr(true, left, right)
+case fexpr.SignNeq, fexpr.SignAnyNeq:    // != 和 ?!= 走同一条分支
+    expr = resolveEqualExpr(false, left, right)
+case fexpr.SignLike, fexpr.SignAnyLike:  // ~ 和 ?~ 走同一条分支
+    expr = dbx.NewExp(fmt.Sprintf("%s LIKE ..."), ...)
+case fexpr.SignGt, fexpr.SignAnyGt:      // > 和 ?> 走同一条分支
+    expr = dbx.NewExp(fmt.Sprintf("%s > %s", ...), ...)
+// ... 其余运算符同理
+```
+
+完整映射表：
+
+| DSL 运算符 | SQL 比较符 | 含义 | 是否默认附加全称量化 |
+|-----------|-----------|------|---------------------|
+| `=` | `=`（带 NULL 处理） | 相等 | 是 |
+| `?=` | `=`（带 NULL 处理） | 相等 | 否 |
+| `!=` | `IS NOT`（带 NULL 处理） | 不等 | 是 |
+| `?!=` | `IS NOT`（带 NULL 处理） | 不等 | 否 |
+| `~` | `LIKE`（自动 `%` 包裹） | 包含匹配 | 是 |
+| `?~` | `LIKE`（自动 `%` 包裹） | 包含匹配 | 否 |
+| `!~` | `NOT LIKE` | 不包含 | 是 |
+| `?!~` | `NOT LIKE` | 不包含 | 否 |
+| `>` | `>` | 大于 | 是 |
+| `?>` | `>` | 大于 | 否 |
+| `>=` | `>=` | 大于等于 | 是 |
+| `?>=` | `>=` | 大于等于 | 否 |
+| `<` | `<` | 小于 | 是 |
+| `?<` | `<` | 小于 | 否 |
+| `<=` | `<=` | 小于等于 | 是 |
+| `?<=` | `<=` | 小于等于 | 否 |
 
 ### 3.2 正向关系 JOIN
 
@@ -318,10 +357,11 @@ expr = dbx.Enclose(dbx.And(expr, mm))   // expr 是直接比较，mm 是全称�
 | DSL 表达式 | 模式 | WHERE 子句核心 | 行为解释 |
 |-----------|------|---------------|---------|
 | `title > true` | 标量字段 | `[[demo4.title]] > 1` | 无 JOIN，直接列比较 |
-| `self_rel_one.title > true` | 单值关系 + 标准运算符 | `[[demo4_self_rel_one.title]] > 1` | 单值关系不触发 Multi-Match，等价于 ANY |
-| `self_rel_many.title ?> 'test'` | 多值关系 + ANY 运算符 | `[[demo4_self_rel_many.title]] = {:TEST}` | 仅 LEFT JOIN + DISTINCT，**存在至少一个匹配**即可返回 |
-| `self_rel_many.title = 'test'` | 多值关系 + 标准运算符 | `( [[...]] = {:TEST} AND NOT EXISTS( WHERE NOT( [[...]] = {:TEST} ) ) )` | LEFT JOIN 做存在性 + NOT EXISTS 做全称量化 → **所有关联记录都必须匹配** |
-| `self_rel_many.self_rel_one > true` | 嵌套多值关系 + 标准运算符 | `(直接表达式 AND NOT EXISTS(子查询 WHERE NOT(...)) )` | 完整关系链上的所有路径值都必须满足 |
+| `self_rel_one.title > true` | 单值关系 + 标准运算符 | `[[demo4_self_rel_one.title]] > 1` | 单值关系一对一，不触发 Multi-Match，实际效果等价于 ANY |
+| `self_rel_many.title ?= 'test'` | 多值关系 + ANY 运算符 | `[[demo4_self_rel_many.title]] = {:TEST}` | 仅 LEFT JOIN + DISTINCT，**存在至少一个关联记录 title = 'test'** 即返回 |
+| `self_rel_many.title = 'test'` | 多值关系 + 标准运算符 | `([[...]] = {:TEST} AND NOT EXISTS( WHERE NOT( [[...]] = {:TEST} ) ))` | 直接表达式做存在性 + NOT EXISTS 全称量化 → **所有关联记录的 title 都必须等于 'test'，且关联非空** |
+| `self_rel_many.self_rel_one ?> true` | 嵌套多值关系 + ANY 运算符 | `[[demo4_self_rel_many.self_rel_one]] > 1` | 仅 LEFT JOIN + DISTINCT，**存在至少一条路径满足 self_rel_one > 1** 即返回 |
+| `self_rel_many.self_rel_one > true` | 嵌套多值关系 + 标准运算符 | `(直接表达式 AND NOT EXISTS(子查询 WHERE NOT(...)))` | 完整关系链上**所有路径**的 self_rel_one 都必须 > 1 |
 | `demo4_via_rel_one_unique.id = true` | 反向单值 + 唯一索引 | `[[demo3_demo4_via_rel_one_unique.id]] = 1` | 唯一索引保证一对一，无需全称量化 |
 | `demo4_via_rel_one_cascade.id = true` | 反向单值 + 无唯一索引 | `(直接表达式 AND NOT EXISTS(...))` | 多条反向记录可能指向同一目标 → 需要全称量化 |
 
