@@ -292,13 +292,15 @@ createCollectionIndexes(txApp, newCollection)
 
 本节深入分析 `normalizeSingleVsMultipleFieldChanges` 在三种特殊场景下的代码执行路径。
 
-#### 4.4.1 场景一：新增多值字段时旧字段缺失
+#### 4.4.1 场景一：新增多值字段时旧字段缺失的可达路径分析
 
 [collection_record_table_sync.go L161-L178](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/collection_record_table_sync.go#L161-L178)
 
-代码中一个关键的防御性设计：当 `oldField == nil`（oldCollection 的 Fields 中找不到该字段）时，函数仍然允许继续执行，注释写道 *"allow to continue even if there is no old field for the cases when a new field is added and there are already inserted data"*。
+代码中 `oldField == nil` 时不直接跳过，注释写道 *"allow to continue even if there is no old field for the cases when a new field is added and there are already inserted data"*。但结合 `SyncRecordTableSchema` 的完整执行时序和 `FieldsList.add()` 的 ID 复用逻辑，**实际可达路径只有一条，其余在更早阶段就会失败**。
 
-**执行判定逻辑**：
+---
+
+**前置判定逻辑**：
 
 ```go
 var isOldMultiple bool                              // 默认 false
@@ -318,35 +320,117 @@ if isOldMultiple == isNewMultiple {
 }
 ```
 
-当新增一个多值字段（MaxSelect > 1）时：
+当新增多值字段（MaxSelect > 1）时：
 - `oldField == nil` → `isOldMultiple = false`
 - `newField.MaxSelect > 1` → `isNewMultiple = true`
-- 二者不相等，**仍然会进入完整的"单→多"转换流程**
+- 条件满足，进入转换流程
 
-**常规路径（AddColumn 之后继续转换）**：
+---
 
-新增字段在 `SyncRecordTableSchema` 的 L102-L129 已经处理过：
-1. `AddColumn` 临时列名，列类型为 `JSON DEFAULT '[]' NOT NULL`（因为是多值）
-2. `RenameColumn` 临时列名 → 真实列名
-3. SQLite 自动用 `'[]'` 填充所有已有行
+**关键前置：FieldsList.add() 的 ID 复用机制**
 
-然后进入 `normalizeSingleVsMultipleFieldChanges`，又做一次：
-1. 删视图 → `RenameColumn(真实名, 临时名)` → `AddColumn(真实名, JSON DEFAULT '[]')` → UPDATE → `DropColumn(临时名)` → 恢复视图
+[fields_list.go L208-L276](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/fields_list.go#L208-L276)
 
-其中 UPDATE 语句执行时，所有行的 `oldTempCol` 值就是 `'[]'`，`COALESCE('[]', '') = ''` → 结果仍然是 `'[]'`。**这是一次等幂操作，数据不变，但消耗了额外的性能。**
+在 `onCollectionSave` 中会执行 `e.Collection.Fields = NewFieldsList(e.Collection.Fields...)` 重建字段列表。用户通过 API 提交的新字段通常不带 ID，`add()` 按以下逻辑处理：
 
-**边缘路径（已存在遗留列）**：
+1. `newFieldId == ""` → `replaceByName = true`
+2. 自动生成 ID：`baseId = field.Type() + crc32Checksum(field.Name)`，冲突时追加数字
+3. **按 Name 匹配旧字段**，若找到则**复用旧字段的 ID**
 
-真正有意义的场景是：
-1. SQLite 表中已经存在一个 TEXT 类型的同名列（比如之前通过直接 SQL 操作添加的，或者字段曾被从 `_collections` 的 Fields JSON 中移除但 DROP COLUMN 没成功）
-2. 用户现在通过 API 将其**重新添加**为多值字段
+因此：
+- 旧 Collection 中有同名字段 → 复用 ID → `oldField != nil`（非 nil 分支，不是本场景讨论范围）
+- 旧 Collection 中无同名字段 → 新生成 ID → `oldField == nil`（本场景）
 
-此时：
-- `SyncRecordTableSchema` L102-L110：`AddColumn` 临时列名（不与已存在的真名冲突）
-- L123-L129：`RenameColumn(临时列名, 真实列名)` — 如果真实列名已存在，此处会报错
-- 或者：如果 `FieldsList.add()` 按 Name 匹配复用了遗留列的 Field ID，则 `oldField != nil`，按正常路径改名+转换
+---
 
-即使 `oldField == nil`，转换流程的 UPDATE SQL 也能安全处理遗留 TEXT 列中的数据：`NULL`/空字符串 → `'[]'`，字符串值 → `json_array(value)`。
+**路径 A（唯一可达）：常规新增多值字段（无遗留列，oldField == nil）**
+
+```
+onCollectionSave → NewFieldsList.add(newField, no ID)
+    ├─ replaceByName = true
+    ├─ 按 Name("tags") 查旧 Fields → 未找到
+    ├─ 生成新 ID: "select" + crc32("tags")
+    └─ 插入为新字段
+
+SyncRecordTableSchema:
+  阶段 B (L102-L110):
+    oldField = oldFields.GetById(newField.Id) → nil
+    tempName = "tags" + "XxXxx" (随机5字符)
+    AddColumn(table, "tagsXxXxx", "JSON DEFAULT '[]' NOT NULL") → 成功
+    toRename["tagsXxXxx"] = "tags"
+
+  阶段 C (L123-L129):
+    RenameColumn(table, "tagsXxXxx", "tags") → 成功（表中原本无此列）
+
+  阶段 D: normalizeSingleVsMultipleFieldChanges
+    isOldMultiple = false (oldField == nil)
+    isNewMultiple = true (MaxSelect > 1)
+    → 进入"单→多"转换：
+       1. 删视图
+       2. RenameColumn: "tags" → "_tagsYyyYy" (第二次改名)
+       3. AddColumn: "tags" JSON DEFAULT '[]' NOT NULL (第二次加列)
+       4. UPDATE: 所有行 '_tagsYyyYy' 的值是 '[]' → COALESCE('', '') = '' → 结果仍为 '[]'
+       5. DropColumn: "_tagsYyyYy"
+       6. 恢复视图
+```
+
+**结果**：阶段 B-C 已经创建了正确的 JSON 列并填充了 `'[]'`，阶段 D 又做了一次 rename→add→等幂 UPDATE→drop。整个过程是**等幂的无副作用操作**，但消耗了额外的性能（视图删/恢复、三次列操作）。
+
+---
+
+**路径 B（不可达，阶段 C 失败）：真实列名已存在于 SQLite 表中（oldField == nil）**
+
+```
+假设 SQLite 表中已存在 TEXT 列 "tags"（直接 SQL 遗留），但旧 Collection Fields 中没有：
+
+onCollectionSave → NewFieldsList.add(newField, no ID)
+    ├─ replaceByName = true
+    ├─ 按 Name("tags") 查旧 Fields → 未找到（Fields 中没有）
+    └─ 生成新 ID，插入为新字段
+
+SyncRecordTableSchema:
+  阶段 B (L102-L110):
+    oldField = oldFields.GetById(newField.Id) → nil
+    tempName = "tags" + "XxXxx"
+    AddColumn(table, "tagsXxXxx", "JSON DEFAULT '[]' NOT NULL") → 成功（临时名不冲突）
+    toRename["tagsXxXxx"] = "tags"
+
+  阶段 C (L123-L129):
+    RenameColumn(table, "tagsXxXxx", "tags")
+    → ❌ SQLite 报错: "duplicate column name: tags"
+    → 整个事务回滚
+    → 阶段 D normalizeSingleVsMultipleFieldChanges 永远不会执行
+```
+
+**结论**：normalize 中 `oldField == nil` 的防御性代码**无法处理真实列名已存在的场景**，因为流程在更早的阶段 C 就已失败并回滚。注释中提到的 *"when a new field is added and there are already inserted data"* 实际指路径 A 中表中已有**其他行**（非该列）时 AddColumn 的默认值填充已经完成，normalize 只是做了一次等幂确认。
+
+---
+
+**路径 C（不可达，验证阶段失败）：旧字段同名但 Type 不同（oldField != nil）**
+
+```
+假设旧 Collection Fields 中已有 TextField "tags"，用户提交新的多值 SelectField "tags"：
+
+onCollectionSave → NewFieldsList.add(newField, no ID)
+    ├─ 按 Name("tags") 查旧 Fields → 找到（TextField）
+    └─ 复用旧字段的 ID
+
+collection_validate.go ensureNoFieldsTypeChange:
+    oldField = validator.original.Fields.GetById(field.Id) → 找到（TextField）
+    oldField.Type() = "text" ≠ newField.Type() = "select"
+    → ❌ 报错: "Field type cannot be changed."
+    → 根本到不了 SyncRecordTableSchema
+```
+
+---
+
+**路径 D（非 nil 分支，非本场景）：旧字段同名同 Type 单值→多值（oldField != nil）**
+
+这是真正的数据转换场景（oldField != nil），见 4.4.2 路径 B。此时：
+- `add()` 按 Name 匹配并复用旧 ID → `oldField != nil`
+- `oldField.IsMultiple() = false`，`newField.IsMultiple() = true`
+- 阶段 B 跳过（Name 相同），阶段 C 跳过
+- 阶段 D 执行真实数据转换：TEXT → JSON
 
 #### 4.4.2 场景二：已有数据时的同步路径
 
@@ -612,7 +696,7 @@ Automigrate 插件（如启用）: 生成迁移代码文件
 
 7. **双重缓存**：`ReloadCachedCollections()` 在成功和失败时都触发，失败时回滚到之前的缓存状态。
 
-8. **新增多值字段的防御性设计**：即使 oldCollection 中不存在该字段定义（`oldField == nil`），如果新字段是多值，仍然会进入完整的"单→多"转换流程。常规路径下这是一次等幂操作（数据从 `'[]'` 转为 `'[]'`），但可以处理 SQLite 表中已存在遗留 TEXT 列的边缘场景。
+8. **新增多值字段的等幂转换**：即使 oldCollection 中不存在该字段定义（`oldField == nil`），如果新字段是多值，仍然会进入完整的"单→多"转换流程。常规路径下这是一次等幂操作（阶段 B-C 已用 `JSON DEFAULT '[]'` 建列，阶段 D 又做一次 rename→add→UPDATE `'[]'`→`'[]'`→drop）。注意：SQLite 表中若已存在真实列名，会在阶段 C 的 `RenameColumn(临时名→真名)` 因 "duplicate column name" 失败并回滚，normalize 中的防御性代码不会被触发。
 
 9. **视图恢复的直接执行策略**：视图恢复时直接执行保存的原始 `CREATE VIEW` SQL，不经过 `SaveView()` 的 `SELECT * FROM (query)` 包裹和 `TableInfo` 校验。前提是视图由 PocketBase 合法创建，定义已在保存前验证过。
 
