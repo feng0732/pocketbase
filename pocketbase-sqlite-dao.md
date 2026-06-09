@@ -10,8 +10,8 @@ PocketBase 的数据访问层采用**两层架构**，通过 `dbx.Builder` 接�
 
 | 层次 | 职责 | 核心文件 |
 |------|------|----------|
-| **SQLite 嵌入层** | 驱动加载、连接池管理、WAL 模式配置、PRAGMA 参数设置 | [db_connect.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_connect.go)、[base.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/base.go) |
-| **DAO 抽象层** | 模型 CRUD、事务生命周期、Hook 系统、读写路由、锁重试 | [db.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go)、[db_tx.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_tx.go)、[db_builder.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_builder.go)、[db_retry.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_retry.go) |
+| **SQLite 嵌入层** | 驱动加载、连接池管理、WAL 模式配置、PRAGMA 参数设置 | [db_connect.go](core/db_connect.go)、[base.go](core/base.go) |
+| **DAO 抽象层** | 模型 CRUD、事务生命周期、Hook 系统、读写路由、锁重试 | [db.go](core/db.go)、[db_tx.go](core/db_tx.go)、[db_builder.go](core/db_builder.go)、[db_retry.go](core/db_retry.go) |
 
 依赖关系：`github.com/pocketbase/dbx v1.12.0`（查询构建器）+ `modernc.org/sqlite v1.52.0`（纯 Go SQLite 驱动）。
 
@@ -44,7 +44,7 @@ SQLite 在 WAL 模式下虽支持"一读一写"并发，但同一时刻仍只允
 
 ### 2.2 连接池初始化代码
 
-主数据库 `data.db` 初始化见 [base.go#L1175-L1209](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/base.go#L1175-L1209)：
+主数据库 `data.db` 初始化见 [base.go#L1175-L1209](core/base.go#L1175-L1209)：
 
 ```go
 func (app *BaseApp) initDataDB() error {
@@ -68,11 +68,11 @@ func (app *BaseApp) initDataDB() error {
 }
 ```
 
-辅助数据库 `auxiliary.db` 初始化见 [base.go#L1235-L1260](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/base.go#L1235-L1260)，逻辑完全相同。
+辅助数据库 `auxiliary.db` 初始化见 [base.go#L1235-L1260](core/base.go#L1235-L1260)，逻辑完全相同。
 
 ### 2.3 连接池参数汇总
 
-默认常量定义在 [base.go#L32-L37](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/base.go#L32-L37)：
+默认常量定义在 [base.go#L32-L37](core/base.go#L32-L37)：
 
 | 参数 | data.db 默认值 | auxiliary.db 默认值 | 作用 |
 |------|---------------|---------------------|------|
@@ -87,7 +87,7 @@ func (app *BaseApp) initDataDB() error {
 
 ### 2.4 SQLite 驱动加载与 PRAGMA 配置
 
-连接建立由 [db_connect.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_connect.go) 中的 `DefaultDBConnect` 负责：
+连接建立由 [db_connect.go](core/db_connect.go) 中的 `DefaultDBConnect` 负责：
 
 ```go
 func DefaultDBConnect(dbPath string) (*dbx.DB, error) {
@@ -126,7 +126,7 @@ PocketBase 维护两个物理 SQLite 文件（各自拥有独立的双连接池�
 | 数据库文件 | 用途 | 访问方法 |
 |-----------|------|---------|
 | `data.db` | 主业务数据：collections、records、settings、auth 等 | `DB()` / `ConcurrentDB()` / `NonconcurrentDB()` |
-| `auxiliary.db` | 辅助数据：logs 等（注：原名为 "aux.db"，因 Windows 保留字 "AUX" 而改名） | `AuxDB()` / `AuxConcurrentDB()` / `AuxNonconcurrentDB()` |
+| `auxiliary.db` | 辅助数据：logs 等（注：曾使用过三字母辅助库名称，后因 Windows 保留字 "AUX" 改名） | `AuxDB()` / `AuxConcurrentDB()` / `AuxNonconcurrentDB()` |
 
 ---
 
@@ -134,7 +134,7 @@ PocketBase 维护两个物理 SQLite 文件（各自拥有独立的双连接池�
 
 ### 3.1 自动路由入口
 
-用户通常调用 `app.DB()` 获取 `dbx.Builder`。`DB()` 方法会判断当前状态并返回合适的实例，见 [base.go#L490-L500](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/base.go#L490-L500)：
+用户通常调用 `app.DB()` 获取 `dbx.Builder`。`DB()` 方法会判断当前状态并返回合适的实例，见 [base.go#L490-L500](core/base.go#L490-L500)：
 
 ```go
 func (app *BaseApp) DB() dbx.Builder {
@@ -153,7 +153,7 @@ func (app *BaseApp) DB() dbx.Builder {
 
 ### 3.2 dualDBBuilder 的方法级路由表
 
-[db_builder.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_builder.go) 实现了 `dbx.Builder` 接口，将每个方法路由到不同连接池：
+[db_builder.go](core/db_builder.go) 实现了 `dbx.Builder` 接口，将每个方法路由到不同连接池：
 
 | 方法 | 路由目标 | 说明 |
 |------|---------|------|
@@ -166,7 +166,7 @@ func (app *BaseApp) DB() dbx.Builder {
 
 ### 3.3 NewQuery：SQL 前缀检测路由
 
-对于原始 SQL 查询，通过检测前缀来路由，见 [db_builder.go#L151-L160](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_builder.go#L151-L160)：
+对于原始 SQL 查询，通过检测前缀来路由，见 [db_builder.go#L151-L160](core/db_builder.go#L151-L160)：
 
 ```go
 func (b *dualDBBuilder) NewQuery(str string) *dbx.Query {
@@ -184,17 +184,17 @@ func (b *dualDBBuilder) NewQuery(str string) *dbx.Query {
 
 ### 3.4 DAO 层的显式池选择
 
-在 DAO 层（[db.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go)）中，各操作显式选择对应池：
+在 DAO 层（[db.go](core/db.go)）中，各操作显式选择对应池：
 
 | 操作 | 使用的池 | 代码位置 |
 |------|---------|---------|
-| `ModelQuery()`（模型 SELECT 查询） | ConcurrentDB | [db.go#L67-L69](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go#L67-L69) |
-| `Save()` → `create()`（INSERT） | NonconcurrentDB | [db.go#L290-L296](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go#L290-L296) |
-| `Save()` → `update()`（UPDATE） | NonconcurrentDB | [db.go#L385-L391](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go#L385-L391) |
-| `Delete()`（DELETE） | NonconcurrentDB | [db.go#L124-L130](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go#L124-L130) |
-| `validateRecordId()`（存在性检查 SELECT） | ConcurrentDB | [db.go#L487-L491](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go#L487-L491) |
-| `HasTable() / TableInfo() / TableColumns()`（元数据查询） | ConcurrentDB | [db_table.go#L101-L107](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_table.go#L101-L107) |
-| `DeleteTable() / Vacuum()`（DDL / 维护操作） | NonconcurrentDB | [db_table.go#L90-L95](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_table.go#L90-L95) |
+| `ModelQuery()`（模型 SELECT 查询） | ConcurrentDB | [db.go#L67-L69](core/db.go#L67-L69) |
+| `Save()` → `create()`（INSERT） | NonconcurrentDB | [db.go#L290-L296](core/db.go#L290-L296) |
+| `Save()` → `update()`（UPDATE） | NonconcurrentDB | [db.go#L385-L391](core/db.go#L385-L391) |
+| `Delete()`（DELETE） | NonconcurrentDB | [db.go#L124-L130](core/db.go#L124-L130) |
+| `validateRecordId()`（存在性检查 SELECT） | ConcurrentDB | [db.go#L487-L491](core/db.go#L487-L491) |
+| `HasTable() / TableInfo() / TableColumns()`（元数据查询） | ConcurrentDB | [db_table.go#L101-L107](core/db_table.go#L101-L107) |
+| `DeleteTable() / Vacuum()`（DDL / 维护操作） | NonconcurrentDB | [db_table.go#L90-L95](core/db_table.go#L90-L95) |
 
 ---
 
@@ -202,7 +202,7 @@ func (b *dualDBBuilder) NewQuery(str string) *dbx.Query {
 
 ### 4.1 事务 API 入口
 
-事务总是从**非并发写池**启动（确保同一事务内读写使用同一连接），见 [db_tx.go#L11-L23](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_tx.go#L11-L23)：
+事务总是从**非并发写池**启动（确保同一事务内读写使用同一连接），见 [db_tx.go#L11-L23](core/db_tx.go#L11-L23)：
 
 ```go
 // 主库事务
@@ -218,7 +218,7 @@ func (app *BaseApp) AuxRunInTransaction(fn func(txApp App) error) error {
 
 ### 4.2 嵌套事务的复用机制
 
-`runInTransaction` 支持安全嵌套，核心逻辑是类型判断，见 [db_tx.go#L25-L49](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_tx.go#L25-L49)：
+`runInTransaction` 支持安全嵌套，核心逻辑是类型判断，见 [db_tx.go#L25-L49](core/db_tx.go#L25-L49)：
 
 ```go
 func (app *BaseApp) runInTransaction(db dbx.Builder, fn func(txApp App) error, isForAuxDB bool) error {
@@ -256,7 +256,7 @@ func (app *BaseApp) runInTransaction(db dbx.Builder, fn func(txApp App) error, i
 
 ### 4.3 事务 App 的克隆机制
 
-通过**浅拷贝 BaseApp** 来隔离事务状态，见 [db_tx.go#L51-L69](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_tx.go#L51-L69)：
+通过**浅拷贝 BaseApp** 来隔离事务状态，见 [db_tx.go#L51-L69](core/db_tx.go#L51-L69)：
 
 ```go
 func (app *BaseApp) createTxApp(tx *dbx.Tx, isForAuxDB bool) *BaseApp {
@@ -284,7 +284,7 @@ func (app *BaseApp) createTxApp(tx *dbx.Tx, isForAuxDB bool) *BaseApp {
 
 ### 4.4 TxAppInfo：事务完成回调注册表
 
-`TxAppInfo` 是事务与 Hook 系统的桥梁，见 [db_tx.go#L71-L112](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_tx.go#L71-L112)：
+`TxAppInfo` 是事务与 Hook 系统的桥梁，见 [db_tx.go#L71-L112](core/db_tx.go#L71-L112)：
 
 ```go
 type TxAppInfo struct {
@@ -323,7 +323,7 @@ func (a *TxAppInfo) runAfterFuncs(txErr error) error {
 
 事务中的 `OnModelAfterCreateSuccess` / `OnModelAfterDeleteError` 等副作用 Hook 不会立即执行，而是通过 `txInfo.OnComplete()` 延迟到事务真正结束。
 
-以 `create` 操作为例，见 [db.go#L343-L363](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go#L343-L363)：
+以 `create` 操作为例，见 [db.go#L343-L363](core/db.go#L343-L363)：
 
 ```go
 if app.txInfo != nil {
@@ -368,7 +368,7 @@ PocketBase 通过三层机制应对 SQLite 的并发写入限制：
 
 ### 5.2 重试逻辑详解
 
-核心实现在 [db_retry.go](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_retry.go)：
+核心实现在 [db_retry.go](core/db_retry.go)：
 
 ```go
 // 重试间隔表（毫秒）。注意：索引 0 的值 50ms 永远不会被使用，因为 attempt 从 1 开始
@@ -398,7 +398,7 @@ Retry:
 
 ### 5.3 重试间隔与总等待时间计算
 
-`getDefaultRetryInterval` 的实现，见 [db_retry.go#L64-L70](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_retry.go#L64-L70)：
+`getDefaultRetryInterval` 的实现，见 [db_retry.go#L64-L70](core/db_retry.go#L64-L70)：
 
 ```go
 func getDefaultRetryInterval(attempt int) time.Duration {
@@ -435,7 +435,7 @@ func getDefaultRetryInterval(attempt int) time.Duration {
 
 #### (1) execLockRetry：查询执行 Hook（带超时 Context）
 
-用于通过 `WithExecHook` 注入到查询构建器，自动附加 `QueryTimeout`（默认 30 秒），见 [db_retry.go#L20-L41](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_retry.go#L20-L41)：
+用于通过 `WithExecHook` 注入到查询构建器，自动附加 `QueryTimeout`（默认 30 秒），见 [db_retry.go#L20-L41](core/db_retry.go#L20-L41)：
 
 ```go
 func execLockRetry(timeout time.Duration, maxRetries int) dbx.ExecHookFunc {
@@ -461,7 +461,7 @@ func execLockRetry(timeout time.Duration, maxRetries int) dbx.ExecHookFunc {
 }
 ```
 
-在 `ModelQuery()` 中自动注入，见 [db.go#L83-L85](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go#L83-L85)：
+在 `ModelQuery()` 中自动注入，见 [db.go#L83-L85](core/db.go#L83-L85)：
 
 ```go
 func (app *BaseApp) modelQuery(db dbx.Builder, m Model) *dbx.SelectQuery {
@@ -474,7 +474,7 @@ func (app *BaseApp) modelQuery(db dbx.Builder, m Model) *dbx.SelectQuery {
 
 #### (2) baseLockRetry：DAO 层直接调用
 
-所有写入操作（Save/Delete 等）显式调用，以 `Delete` 为例，见 [db.go#L132-L138](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db.go#L132-L138)：
+所有写入操作（Save/Delete 等）显式调用，以 `Delete` 为例，见 [db.go#L132-L138](core/db.go#L132-L138)：
 
 ```go
 return baseLockRetry(func(attempt int) error {
@@ -487,7 +487,7 @@ return baseLockRetry(func(attempt int) error {
 
 ### 5.5 定期 WAL Checkpoint 与优化
 
-后台 Cron 每天午夜（`0 0 * * *`）执行一次数据库维护，见 [base.go#L1360-L1375](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/base.go#L1360-L1375)：
+后台 Cron 每天午夜（`0 0 * * *`）执行一次数据库维护，见 [base.go#L1360-L1375](core/base.go#L1360-L1375)：
 
 ```go
 app.Cron().Add("__pbDBOptimize__", "0 0 * * *", func() {
@@ -532,7 +532,7 @@ app.Save(model)
 
 ### 6.2 Model 接口契约
 
-DAO 层操作的所有实体必须实现 [Model](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_model.go#L6-L13) 接口：
+DAO 层操作的所有实体必须实现 [Model](core/db_model.go#L6-L13) 接口：
 
 ```go
 type Model interface {
@@ -545,7 +545,7 @@ type Model interface {
 }
 ```
 
-[BaseModel](file:///d:/fz/0601/solo-dogfeeding/code/150-pocketbase/core/db_model.go#L16-L59) 提供默认实现，通过 `lastSavedPK` 字段追踪持久化状态：
+[BaseModel](core/db_model.go#L16-L59) 提供默认实现，通过 `lastSavedPK` 字段追踪持久化状态：
 
 ```go
 type BaseModel struct {
@@ -591,7 +591,7 @@ func (m *BaseModel) PostScan() error  { m.MarkAsNotNew(); return nil }
 │  ┌─────────────────────┐     ┌─────────────────────┐                 │
 │  │  Concurrent Pool    │     │ Nonconcurrent Pool  │                 │
 │  │  data.db: 120 连接   │     │  data.db: 1 连接    │                 │
-│  │  aux.db: 20 连接     │     │  aux.db: 1 连接     │                 │
+│  │  auxiliary.db: 20 连接 │     │  auxiliary.db: 1 连接 │                 │
 │  └──────────┬──────────┘     └──────────┬──────────┘                 │
 │             │                           │                            │
 │             └─────────────┬─────────────┘                            │
