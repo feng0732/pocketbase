@@ -32,7 +32,7 @@ Provider.ParseAndExec(urlQuery, &records)
 原始 filter 字符串
   ↓
 1. 替换占位符参数 {:name} → 安全引用后的值
-2. 查 parsedFilterData 缓存（最多 500 条 LRU）
+2. 查 parsedFilterData 缓存（全局硬上限 500 条，达到上限后拒绝新增，无淘汰策略、无 LRU）
 3. fexpr.Parse(raw) → 生成 []fexpr.ExprGroup AST
 4. buildParsedFilterExpr(data, fieldResolver, &maxExpressions)
   ↓
@@ -452,9 +452,16 @@ SQLite 的 `_rowid_` 是内置主键别名，无需额外索引即可高效计�
 - **字符串/数字字面量**：`resolveToken` 遇到 `TokenText` / `TokenNumber`，生成 `{:tXXXXXXXX}` 占位符，值存入 `dbx.Params`
 - **标识符宏**（`@now` 等）：同样用 `{:tXXXXXXXX}` 占位符
 - **`@request.*` 静态值**：用 `{:fXXXXXXXXXX}` 占位符
-- **表别名**：用 `security.PseudorandomString(8)` 生成随机后缀，同时避免别名冲突和可预测性
+- **表别名与子查询别名**：用 `security.PseudorandomString(8)` 生成 8 字符随机后缀（如 `__smXxXxXxXx`）
 
-`security.PseudorandomString` 使用密码学安全随机源 [tools/security/random.go](./tools/security/random.go)。
+`PseudorandomString` 和 `RandomString` 的关键区别 [tools/security/random.go](./tools/security/random.go)：
+
+| 函数 | 底层实现 | 密码学安全 | 用途 |
+|------|----------|-----------|------|
+| `PseudorandomString` | `math/rand/v2.IntN()` | ❌ 否，快速 PRNG | 参数占位符名、SQL 别名后缀——仅用于**防止不同子表达式组合时发生标识符冲突**，并非安全防护手段 |
+| `RandomString` | `crypto/rand.Int()` | ✅ 是 | token、密钥等真正需要不可预测的安全场景 |
+
+随机后缀的实际作用：当多个 `ResolverResult` 通过 `AND` / `OR` 组合成更大的表达式时，各自生成的别名和占位符名不会互相冲突。攻击者若能预测后缀名，也无法注入 SQL——因为这些标识符从不直接包含用户输入，始终由 dbx 层做引用转义。
 
 ### 5.2 占位符替换安全
 
@@ -493,22 +500,24 @@ raw = strings.ReplaceAll(raw, "{:"+key+"}", replacement)
 | strftime 最大参数 | — | 10 | [tools/search/token_functions.go](./tools/search/token_functions.go#L89-L91) |
 | 展开查询限制 | — | 1000 条 | [core/record_query_expand.go](./core/record_query_expand.go#L108) |
 | 每页最大数量 | `MaxPerPage` | 1000 | [tools/search/provider.go](./tools/search/provider.go#L27) |
-| 解析缓存上限 | — | 500 | [tools/search/filter.go](./tools/search/filter.go#L102) |
+| 解析缓存上限 | — | 500 条全局硬上限，达到后拒绝新增（无淘汰策略、无 LRU） | [tools/search/filter.go](./tools/search/filter.go#L102)、[tools/store/store.go](./tools/store/store.go#L202-L227) |
 
 ### 5.5 ListRule 顶层绑定
 
-如 3.7 节所述，关联集合的 ListRule 被绑定在最外层 `AND WHERE`，而非子查询内部。防止侧信道攻击。
+如 3.7 节所述，关联集合的 ListRule 被绑定在最外层 `AND WHERE`，而非嵌在子查询内部。代码注释 [core/record_field_resolver.go](./core/record_field_resolver.go#L160-L208) 说明这是出于安全审慎：若将规则写进子查询，攻击者可能通过观察整体查询耗时的细微差异，推断受保护数据是否存在。顶层绑定使得 ListRule 对主查询结果集的过滤效果与客户端过滤条件处于同一层次，减少侧信道可观测的分化。
 
 ### 5.6 定时攻击防护（Timing Attack Mitigation）
 
-在 `recordsList` [apis/record_crud.go](./apis/record_crud.go#L104-L122) 中，当满足以下全部条件时触发随机延迟（0-500ms）：
+在 `recordsList` [apis/record_crud.go](./apis/record_crud.go#L104-L122) 中，当满足以下全部条件时触发 0–500ms 的随机延迟 `randomizedThrottle`：
 1. 非 superuser 请求
 2. 集合有非空 ListRule
 3. 请求携带了 filter 参数
 4. 返回结果为空
 5. 该集合已触发 3 次/3秒 的限流
 
-代码注释说明这不是完美防护，但配合网络延迟在实践中足以提高攻击门槛。真正敏感的字段（password、tokenKey）从根本上就不允许客户端过滤，且必要时使用**常数时间比较**。
+代码注释的表述非常克制：「技术上无法完全保证防御 filter timing 攻击，但配合网络延迟在实践中进一步提高了攻击门槛。真正关心侧信道信息泄露的用户应配置严格的限流或利用 Hidden 字段机制。」
+
+关于「常数时间比较」的说明：`security.Equal` [tools/security/crypto.go](./tools/security/crypto.go#L59-L62) 确实使用了 `crypto/subtle.ConstantTimeCompare`，但它用于 **token 哈希值**和**密码校验**等独立路径——**不用于过滤 DSL 的比较流程**。过滤 DSL 生成的 SQL 比较由 SQLite 引擎在数据库内部执行，不受 Go 层常数时间函数控制。PocketBase 的实际策略是：**password、tokenKey 等敏感字段从根本上就不允许作为客户端过滤字段**，从源头避免 timing 攻击面。
 
 ### 5.7 列名引用规范
 
@@ -589,3 +598,6 @@ raw = strings.ReplaceAll(raw, "{:"+key+"}", replacement)
 | API 层列表入口（定时攻击防护、_rowid_ 计数） | [apis/record_crud.go](./apis/record_crud.go) |
 | 词法分析器基础 | [tools/tokenizer/tokenizer.go](./tools/tokenizer/tokenizer.go) |
 | 多值关系语义测试用例（any vs multi-match 对比） | [core/record_field_resolver_test.go](./core/record_field_resolver_test.go) |
+| 随机字符串生成器（PseudorandomString vs RandomString 安全差异） | [tools/security/random.go](./tools/security/random.go) |
+| 密码学工具（security.Equal 常数时间比较，独立于过滤管线） | [tools/security/crypto.go](./tools/security/crypto.go) |
+| 内存 KV 存储（SetIfLessThanLimit 无淘汰策略） | [tools/store/store.go](./tools/store/store.go) |
