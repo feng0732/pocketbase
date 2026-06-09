@@ -288,7 +288,162 @@ createCollectionIndexes(txApp, newCollection)
 
 6. **恢复视图**（L287-L293）：重新执行步骤 1 保存的所有 CREATE VIEW SQL
 
-### 4.4 删除集合
+### 4.4 边缘场景同步路径分析
+
+本节深入分析 `normalizeSingleVsMultipleFieldChanges` 在三种特殊场景下的代码执行路径。
+
+#### 4.4.1 场景一：新增多值字段时旧字段缺失
+
+[collection_record_table_sync.go L161-L178](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/collection_record_table_sync.go#L161-L178)
+
+代码中一个关键的防御性设计：当 `oldField == nil`（oldCollection 的 Fields 中找不到该字段）时，函数仍然允许继续执行，注释写道 *"allow to continue even if there is no old field for the cases when a new field is added and there are already inserted data"*。
+
+**执行判定逻辑**：
+
+```go
+var isOldMultiple bool                              // 默认 false
+if oldField := oldCollection.Fields.GetById(newField.GetId()); oldField != nil {
+    if mv, ok := oldField.(MultiValuer); ok {
+        isOldMultiple = mv.IsMultiple()
+    }
+}
+
+var isNewMultiple bool
+if mv, ok := newField.(MultiValuer); ok {
+    isNewMultiple = mv.IsMultiple()                 // MaxSelect > 1 时为 true
+}
+
+if isOldMultiple == isNewMultiple {
+    continue // no change
+}
+```
+
+当新增一个多值字段（MaxSelect > 1）时：
+- `oldField == nil` → `isOldMultiple = false`
+- `newField.MaxSelect > 1` → `isNewMultiple = true`
+- 二者不相等，**仍然会进入完整的"单→多"转换流程**
+
+**常规路径（AddColumn 之后继续转换）**：
+
+新增字段在 `SyncRecordTableSchema` 的 L102-L129 已经处理过：
+1. `AddColumn` 临时列名，列类型为 `JSON DEFAULT '[]' NOT NULL`（因为是多值）
+2. `RenameColumn` 临时列名 → 真实列名
+3. SQLite 自动用 `'[]'` 填充所有已有行
+
+然后进入 `normalizeSingleVsMultipleFieldChanges`，又做一次：
+1. 删视图 → `RenameColumn(真实名, 临时名)` → `AddColumn(真实名, JSON DEFAULT '[]')` → UPDATE → `DropColumn(临时名)` → 恢复视图
+
+其中 UPDATE 语句执行时，所有行的 `oldTempCol` 值就是 `'[]'`，`COALESCE('[]', '') = ''` → 结果仍然是 `'[]'`。**这是一次等幂操作，数据不变，但消耗了额外的性能。**
+
+**边缘路径（已存在遗留列）**：
+
+真正有意义的场景是：
+1. SQLite 表中已经存在一个 TEXT 类型的同名列（比如之前通过直接 SQL 操作添加的，或者字段曾被从 `_collections` 的 Fields JSON 中移除但 DROP COLUMN 没成功）
+2. 用户现在通过 API 将其**重新添加**为多值字段
+
+此时：
+- `SyncRecordTableSchema` L102-L110：`AddColumn` 临时列名（不与已存在的真名冲突）
+- L123-L129：`RenameColumn(临时列名, 真实列名)` — 如果真实列名已存在，此处会报错
+- 或者：如果 `FieldsList.add()` 按 Name 匹配复用了遗留列的 Field ID，则 `oldField != nil`，按正常路径改名+转换
+
+即使 `oldField == nil`，转换流程的 UPDATE SQL 也能安全处理遗留 TEXT 列中的数据：`NULL`/空字符串 → `'[]'`，字符串值 → `json_array(value)`。
+
+#### 4.4.2 场景二：已有数据时的同步路径
+
+**路径 A：新增多值字段（表中已有记录）**
+
+```
+SyncRecordTableSchema L102-L129
+    ├─ AddColumn tempName JSON DEFAULT '[]' NOT NULL
+    │   └─ SQLite 自动用 '[]' 填充所有已有行
+    └─ RenameColumn tempName → 真实列名
+         │
+normalizeSingleVsMultipleFieldChanges
+    └─ 等幂 UPDATE: '[]' → '[]'（无数据变化）
+```
+
+**路径 B：单值字段 → 多值字段（表中已有记录）**
+
+```
+normalizeSingleVsMultipleFieldChanges
+    ├─ 删视图
+    ├─ RenameColumn: tags → _tagsXxXxx  (原 TEXT 列)
+    ├─ AddColumn: tags JSON DEFAULT '[]' NOT NULL
+    ├─ UPDATE: 逐行从 _tagsXxXxx 读取 → 转换 → 写入 tags
+    │   ├─ '' 或 NULL → '[]'
+    │   ├─ 已为 JSON 数组 → 原值
+    │   └─ 其他值 (如 "admin") → '["admin"]'
+    ├─ DropColumn: _tagsXxXxx
+    └─ 恢复视图
+```
+
+**路径 C：多值字段 → 单值字段（表中已有记录）**
+
+```
+normalizeSingleVsMultipleFieldChanges
+    ├─ 删视图
+    ├─ RenameColumn: tags → _tagsXxXxx  (原 JSON 列)
+    ├─ AddColumn: tags TEXT DEFAULT '' NOT NULL
+    ├─ UPDATE: 逐行从 _tagsXxXxx 读取 → 转换 → 写入 tags
+    │   ├─ '[]' 或 NULL → ''
+    │   ├─ '["admin","user"]' → 'user'  (取最后一个元素)
+    │   └─ 非数组字符串 → 原值
+    ├─ DropColumn: _tagsXxXxx
+    └─ 恢复视图
+```
+
+**路径 D：多→单时 FileField 的特殊处理**
+
+FileField 的多→单转换只在数据库层面保留最后一个文件名，实际的物理文件对象**不会被删除**。代码注释明确标注：*"for file fields the actual file objects are not deleted allowing additional custom handling via migration"*。需通过自定义迁移手动清理多余文件。
+
+#### 4.4.3 场景三：视图删除与恢复的完整流程
+
+**为什么需要临时删除视图？**
+
+SQLite 有两个限制：
+1. 不支持 `ALTER TABLE ... ALTER COLUMN` 修改列类型
+2. 当列被视图引用时，`DROP COLUMN` 和 `RENAME COLUMN` 会因外键约束失败
+
+PocketBase 没有使用 `PRAGMA writable_schema = 1`（直接篡改系统表），而是采用更安全的替代方案。
+
+**完整流程（每个字段变更都会执行一次）**：
+
+```go
+// L186-L193: 查询 SQLite 元数据
+views := []struct {
+    Name string `db:"name"`
+    SQL  string `db:"sql"`
+}{}
+err := txApp.DB().Select("name", "sql").
+    From("sqlite_master").
+    AndWhere(dbx.NewExp("sql is not null")).
+    AndWhere(dbx.HashExp{"type": "view"}).
+    All(&views)
+
+// L198-L203: 逐个删除
+for _, view := range views {
+    err = txApp.DeleteView(view.Name)  // 执行 DROP VIEW IF EXISTS
+}
+
+// ... 列操作 (RenameColumn / AddColumn / UPDATE / DropColumn) ...
+
+// L287-L293: 逐个恢复
+for _, view := range views {
+    _, err = txApp.DB().NewQuery(view.SQL).Execute()  // 执行原 CREATE VIEW SQL
+}
+```
+
+**关键细节**：
+
+1. **全量删除所有视图**：不是只删 view 类型的 PocketBase Collection，而是 SQLite 层面的全部视图（包括通过其他方式创建的），因为是从 `sqlite_master WHERE type='view'` 查的。
+
+2. **逐字段重复执行**：删除/恢复逻辑在 `for _, newField := range newCollection.Fields` 循环内部。如果有 N 个字段发生 MultiValuer 变更，视图会被删除 N 次并重建 N 次。虽然在同一事务内不影响正确性，但存在性能损耗。
+
+3. **视图定义保持原样**：恢复时直接执行保存的原始 `CREATE VIEW` SQL，不做任何修改。如果视图引用了被改名的列，恢复会失败——不过列改名在 `SyncRecordTableSchema` L111-L129 已经处理过了，视图引用的列名此时应该已经同步更新。
+
+4. **SaveView 与直接执行 SQL 的差异**：`view.go` 中的 `SaveView()` 会用 `SELECT * FROM (query)` 包裹查询并校验 `TableInfo`，但恢复时直接执行原始 SQL，跳过这些校验——因为视图是 PocketBase 自己之前创建的，定义已经是合法的。
+
+### 4.5 删除集合
 
 [collection_model.go L686-L743](file:///d:/fz/0601/solo-dogfeeding/code/149-pocketbase/core/collection_model.go#L686-L743)
 
@@ -456,3 +611,9 @@ Automigrate 插件（如启用）: 生成迁移代码文件
 6. **索引容错**：验证阶段不检查表名（`TableName = "validator"`），实际创建时强制覆盖为当前集合名，允许部分修改集合名时索引定义不更新。
 
 7. **双重缓存**：`ReloadCachedCollections()` 在成功和失败时都触发，失败时回滚到之前的缓存状态。
+
+8. **新增多值字段的防御性设计**：即使 oldCollection 中不存在该字段定义（`oldField == nil`），如果新字段是多值，仍然会进入完整的"单→多"转换流程。常规路径下这是一次等幂操作（数据从 `'[]'` 转为 `'[]'`），但可以处理 SQLite 表中已存在遗留 TEXT 列的边缘场景。
+
+9. **视图恢复的直接执行策略**：视图恢复时直接执行保存的原始 `CREATE VIEW` SQL，不经过 `SaveView()` 的 `SELECT * FROM (query)` 包裹和 `TableInfo` 校验。前提是视图由 PocketBase 合法创建，定义已在保存前验证过。
+
+10. **FileField 的软迁移**：多→单转换只在数据库层面保留最后一个文件名，物理文件对象不删除，需用户通过自定义迁移或手动清理。这是为了避免误删数据，把最终处理权交给开发者。
