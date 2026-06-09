@@ -285,16 +285,111 @@ if !m.IsNew() && m.ignoreUnchangedFields {
 | 校验项 | 说明 |
 |-------|------|
 | 类型检查 | 内部类型断言（如 `record.GetRaw(f.Name).(float64)`），失败返回 `validators.ErrUnsupportedValueType` |
-| Required | 字段值是否为"空"，各字段对"空"定义不同（见下表） |
+| Required | 字段值是否为"空"，各字段对"空"定义不同（见下） |
 | 字段特有约束 | min/max、pattern、length、MinSelect/MaxSelect、MIME 等 |
 
-各字段对"空值"的定义：
-- **text / email / url / editor / date / autodate**: `""`
-- **number**: `0`
-- **bool**: `false`（Required 时要求必须为 true）
-- **relation / select / file 单选**: `""`
-- **relation / select / file 多选**: `[]string{}` 空切片
-- **password**: `Hash == ""`
+---
+
+#### Required 空值语义详细核对
+
+空值判断逻辑在各字段的 `ValidateValue` 中实现，代码上**不直观**，以下按字段逐个对照源码核准：
+
+##### 1. 按字符串空值处理的字段
+
+| 字段 | 空值判断 | 代码依据 |
+|-----|---------|---------|
+| text / email / url / editor | `val == ""` | [core/field_text.go#L184](core/field_text.go#L184)：`if val == "" { if f.Required { return validation.ErrRequired } return nil }` |
+| relation / select / file 单选 | 归一化为 `""` 后判空 | 见各字段 `normalizeValue`，单选 nil → `""` |
+| relation / select / file 多选 | `len(ids) == 0` | [core/field_relation.go#L204](core/field_relation.go#L204)：`len(ids)==0 && f.Required → ErrRequired` |
+
+##### 2. 不按字符串空值处理的字段（重点）
+
+###### (a) DateField —— 用 `types.DateTime.IsZero()` 判断空值
+
+`DateField` 的内部值是 `types.DateTime`（不是 string），空值判断通过 `val.IsZero()`：
+
+```go
+val, ok := record.GetRaw(f.Name).(types.DateTime)
+if val.IsZero() {
+    if f.Required { return validation.ErrRequired }
+    return nil
+}
+```
+
+代码依据：[core/field_date.go#L122-L133](core/field_date.go#L122-L133)
+
+- `PrepareValue(nil)` 返回的零值是零值 `types.DateTime`（对应 0001-01-01 00:00:00 UTC），不是 `""`
+- ColumnType 虽然是 `TEXT DEFAULT '' NOT NULL`，但在内存中用 `types.DateTime` 表示，空字符串经 `types.ParseDateTime("")` 后得到零值时间
+
+###### (b) AutodateField —— 完全不校验（ValidateValue 直接 return nil）
+
+`AutodateField` 的 `ValidateValue` 方法体只有一行：
+
+```go
+func (f *AutodateField) ValidateValue(...) error {
+    return nil   // 不做任何校验，连 Required 都不检查
+}
+```
+
+代码依据：[core/field_autodate.go#L118-L121](core/field_autodate.go#L118-L121)
+
+这意味着：
+- **AutodateField 的 Required 在字段级校验中完全无效**
+- 该字段依赖 `InterceptorActionCreateExecute` 和 `InterceptorActionUpdateExecute` 阶段的 `OnCreate` / `OnUpdate` 配置自动设置时间
+- 用户如果用 `SetRaw` 手动清空值（零值时间），校验也会通过
+
+###### (c) JSONField —— 5 种空值形式（null、""、[]、{}、""）
+
+`JSONField` 的空值判断最复杂，通过白名单 `emptyJSONValues` 匹配：
+
+```go
+var emptyJSONValues = []string{
+    "null", `""`, "[]", "{}", "",
+}
+
+rawStr := strings.TrimSpace(raw.String())
+if f.Required && slices.Contains(emptyJSONValues, rawStr) {
+    return validation.ErrRequired
+}
+```
+
+代码依据：
+- 空值白名单定义：[core/field_json.go#L150-L152](core/field_json.go#L150-L152)
+- Required 判断：[core/field_json.go#L174-L178](core/field_json.go#L174-L178)
+
+即以下 JSON 序列化结果都被视为"空"：
+| 形式 | Go 原始值 | 序列化字符串 |
+|-----|----------|-------------|
+| null | `nil` | `"null"` |
+| 空字符串 | `""` | `` `""` `` |
+| 空数组 | `[]` | `"[]"` |
+| 空对象 | `{}` | `"{}"` |
+| 纯空白（TrimSpace 后） | —— | `""` |
+
+注意 ColumnType 是 `JSON DEFAULT NULL`（允许 NULL），与其他字段的 `NOT NULL` 不同。
+
+###### (d) GeoPointField —— 经纬度都为 0（Null Island）判空
+
+```go
+val, ok := record.GetRaw(f.Name).(types.GeoPoint)
+if val.Lat == 0 && val.Lon == 0 {   // Null Island
+    if f.Required { return validation.ErrRequired }
+    return nil
+}
+```
+
+代码依据：[core/field_geo_point.go#L121-L133](core/field_geo_point.go#L121-L133)
+
+- 注意：经纬度 (0, 0) 是真实存在的地理坐标（几内亚湾的 Null Island），但在 PocketBase 语义上被当作空值
+- ColumnType 是 `JSON DEFAULT '{"lon":0,"lat":0}' NOT NULL`
+
+##### 3. 其他非字符串空值的字段
+
+| 字段 | 空值判断 | 代码依据 |
+|-----|---------|---------|
+| number | `val == 0` | [core/field_number.go#L164](core/field_number.go#L164)：`if val == 0 { if f.Required { return validation.ErrRequired } return nil }` |
+| bool | `val == false` | [core/field_bool.go#L119](core/field_bool.go#L119)：`if !val && f.Required { return validation.ErrRequired }`（Required 时必须为 true） |
+| password | `fp.Hash == ""` | [core/field_password.go#L173](core/field_password.go#L173)：`if f.Required && fp.Hash == "" { return validation.ErrRequired }`（仅校验 Hash，不校验 Plain） |
 
 ### 5.2 RelationField 关联校验
 
