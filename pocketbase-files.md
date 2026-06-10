@@ -164,7 +164,9 @@ func (m *Record) ReplaceModifiers(data map[string]any) map[string]any {
 
 **关键设计**：
 - 不在原 Record 上操作，而是 `Fresh()` 创建一个带有当前 DB 值的临时副本（`core/record_model.go#L634-L650`），确保修饰符基于"旧值"计算，且不产生副作用
-- Map 遍历无序，因此按 key 字符串长度升序处理（短 key 优先），保证多次修饰符叠加结果可预测
+- **只按 key 字符串长度升序排序**：`sort.SliceStable(sortedDataKeys, func(i, j int) bool { return len(key[i]) < len(key[j]) })`（`core/record_model.go#L1374-L1376`）
+- **相同长度 key 不保证先后顺序**：Go 的 map 遍历顺序是随机的，`sort.SliceStable` 对长度相等的元素保持其原始遍历顺序不变，因此长度相同的修饰符处理顺序不确定
+- 只有长度不同的 key 之间才有确定顺序（短 key 先处理）
 
 ### 3.3 `SetIfFieldExists()` → `FindSetter()` 路由
 
@@ -190,14 +192,18 @@ func (m *Record) SetIfFieldExists(key string, value any) Field {
 
 ### 3.4 FileField 支持的 4 种修饰符
 
-`core/field_file.go#L662-L675` 中 `FindSetter()`：
+`core/field_file.go#L662-L675` 中 `FindSetter()`，以字段名 `documents` 为例分析 key 长度：
 
-| key 模式 | 触发函数 | 行为 |
-|----------|----------|------|
-| `"documents"` | `setValue()` | 完全替换为新值（字符串+`*File` 混合） |
-| `"+documents"` | `prependValue()` | 在已有文件列表**头部**插入新文件 |
-| `"documents+"` | `appendValue()` | 在已有文件列表**尾部**追加新文件 |
-| `"documents-"` | `subtractValue()` | 从已有列表中**删除**指定文件名 |
+| key 模式 | key 长度 | 触发函数 | 行为 |
+|----------|----------|----------|------|
+| `"documents"` | 9（最短，一定最先处理） | `setValue()` | 完全替换为新值（字符串+`*File` 混合） |
+| `"+documents"` | 10（与下面两行相同） | `prependValue()` | 在已有文件列表**头部**插入新文件 |
+| `"documents+"` | 10（与上/下行相同） | `appendValue()` | 在已有文件列表**尾部**追加新文件 |
+| `"documents-"` | 10（与上面两行相同） | `subtractValue()` | 从已有列表中**删除**指定文件名 |
+
+> **关键结论**：`+documents`、`documents+`、`documents-` 三者 key 长度相同（均为 `len(fieldName)+1`），它们之间的处理顺序不保证，取决于 Go map 的随机遍历顺序。只有裸字段名 `documents`（长度 `len(fieldName)`）最短，确定最先执行。
+>
+> 该模式也适用于 NumberField（`number+`/`number-` 长度相同）、SelectField、RelationField —— 它们的 FindSetter 都遵循同样的前后缀命名规则。
 
 具体实现（`core/field_file.go#L677-L712`）：
 
@@ -232,21 +238,32 @@ func (f *FileField) subtractValue(record *Record, toRemove any) {
 }
 ```
 
-**修饰符组合示例**：
+**修饰符组合的顺序不确定性示例**：
+
+由于 `documents+` 和 `documents-` key 长度相同，处理顺序取决于 Go map 的随机遍历顺序，不保证固定。某些场景下两种顺序会产生不同结果。
 
 ```
-假设 DB 中 documents = ["a.jpg", "b.jpg"]
+场景: 追加一个新文件，同时删除同一个新文件名（测试边界情况）
+假设 DB 中 documents = ["a.jpg"]
 
 请求 multipart:
-  documents+  = [new_c.pdf]    → 后置追加
-  documents-  = "a.jpg"        → 删除 a.jpg
+  documents+  = ["new_c.pdf"]   → 后置追加 new_c.pdf
+  documents-  = "new_c.pdf"     → 删除 new_c.pdf
 
-ReplaceModifiers 处理（按 key 长度排序，先处理 documents- 再 documents+）:
-  1. documents- → subtractValue → ["b.jpg"]
-  2. documents+ → appendValue   → ["b.jpg", new_c.pdf]
+由于长度相同，存在两种可能的执行路径:
 
-最终保存: ["b.jpg", "new_c.pdf"]
+路径 A（先追加后删除）:
+  1. documents+ → ["a.jpg", "new_c.pdf"]
+  2. documents- → ["a.jpg"]             （删除刚追加的 new_c.pdf，成功）
+  结果: ["a.jpg"]
+
+路径 B（先删除后追加）:
+  1. documents- → ["a.jpg"]             （new_c.pdf 还不存在，删除为 no-op）
+  2. documents+ → ["a.jpg", "new_c.pdf"]
+  结果: ["a.jpg", "new_c.pdf"]
 ```
+
+> **结论**：当多个相同长度修饰符针对同一字段时，结果可能依赖于 map 遍历顺序，无法确定。对同一字段混合使用追加和删除修饰符时需特别注意。如果需要确定性，请分两次请求提交，或在客户端组装最终列表后直接使用裸字段名 `documents` 一次性提交。
 
 ---
 
@@ -612,7 +629,7 @@ app.NewFilesystem()
 
 1. **文件名随机化**：每个上传文件自动追加 10 位随机后缀，既防冲突又实现"不可枚举"的轻量安全。
 
-2. **修饰符通用机制**：`SetterFinder` / `FindSetter` 让每个字段类型自定义 key 模式（`+field`、`field+`、`field-`、`:autogenerate` 等），`ReplaceModifiers` 按 key 长度排序统一解析，确保行为可预测。
+2. **修饰符通用机制**：`SetterFinder` / `FindSetter` 让每个字段类型自定义 key 模式（`+field`、`field+`、`field-`、`:autogenerate` 等），`ReplaceModifiers` **仅按 key 长度升序排序**——长度不同时有确定顺序（短 key 先处理），**相同长度修饰符的先后顺序不保证**（依赖 Go map 的随机遍历顺序）。
 
 3. **先文件后 DB**：上传成功才写 DB，DB 失败回滚文件，从根源避免"DB 有引用但文件不存在"的脏状态。
 
