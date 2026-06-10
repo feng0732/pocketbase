@@ -534,10 +534,93 @@ AuthRule 字段类型是 `*string`，在 [core/collection_model_auth_options.go#
 **关键边界（#2 和 #4）：`nil` ↔ `&""` 互转不会触发 Secret 刷新。**
 
 尽管从语义上看：
-- `nil` = "完全禁止该 Collection 的认证"（代码注释：*disallow authentication altogether*）
-- `&""` = "允许所有 auth record 认证"（空规则 = 无限制）
+- `nil` = "完全禁止该 Collection 的认证"（代码注释：*disallow authentication altogether*），见 [core/record_query.go#L605-L608](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/record_query.go#L605-L608) 的处理：
+  ```go
+  if accessRule == nil {
+      return false, nil  // AuthRule=nil 时直接返回 false，仅 superuser 可通过
+  }
+  ```
+- `&""` = "允许所有 auth record 认证"（空规则 = 无限制），见 [core/record_query.go#L610-L613](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/record_query.go#L610-L613)：
+  ```go
+  if *accessRule == "" {
+      return true, nil  // 空规则 = 所有人可通过
+  }
+  ```
 
-两者语义完全不同，但由于 `cast.ToString(nil) == cast.ToString(&"") == ""`，条件②始终为 false，AND 整体短路为 false，不会刷新 Secret。这是一个有意为之的边界优化：`nil ↔ ""` 之间的切换通常不会产生需要吊销的有效 Token（`nil` 时根本无法登录），故无需触发全局吊销。
+两者语义完全不同，但由于 `cast.ToString(nil) == cast.ToString(&"") == ""`，条件②始终为 false，AND 整体短路为 false，不会刷新 Secret。
+
+---
+
+### `&""` → `nil` 时，旧 JWT 为什么仍能通过 `loadAuthToken` 验签？
+
+这是需要特别注意的安全边界。让我们追踪完整调用链：
+
+**签发路径**（`CanAccessRecord` 检查 AuthRule）：
+
+```
+登录 / auth-refresh
+    │
+    ▼
+recordAuthResponse [apis/record_helpers.go#L58]
+    │
+    └─► CanAccessRecord(authRecord, requestInfo, AuthRule)  [core/record_query.go#L599]
+         │
+         ├─ AuthRule=nil  → return false → 403 禁止签发新 Token ✅
+         └─ AuthRule=&""   → return true  → 正常签发 Token
+```
+
+`CanAccessRecord` **只在签发新 Token 时**被调用，它对 `nil` 和 `&""` 做了正确区分。
+
+**验签路径**（`loadAuthToken` → `FindAuthRecordByToken`，**不检查 AuthRule**）：
+
+```
+普通请求（如 GET /api/collections/secrets/records）
+    │
+    ▼
+loadAuthToken [apis/middlewares.go#L184]
+    │
+    ▼
+FindAuthRecordByToken [core/record_query.go#L483-L539]
+    │
+    ├─ ParseUnverifiedJWT → 提取 id / collectionId / type
+    ├─ FindRecordById → 查 Record
+    ├─ 确认 Record 属于 Auth Collection
+    ├─ 根据 tokenType 取 Secret（如 AuthToken.Secret）
+    ├─ secret = record.TokenKey() + baseTokenKey
+    └─ ParseJWT(token, secret) ──► HS256 验签 ✅ / ❌
+         │
+         └─ 验签成功 → return record → e.Auth 被注入 → 请求放行
+```
+
+**`FindAuthRecordByToken` 的完整代码 [core/record_query.go#L483-L539](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/record_query.go#L483-L539) 中没有任何一行检查 `record.Collection().AuthRule`**。它只做 5 件事：
+1. Token 非空
+2. 必需 claims 存在（id、collectionId、type）
+3. Record 存在且属于 Auth Collection
+4. 根据 tokenType 取对应 Secret
+5. **HS256 验签通过**
+
+所以当管理员把 AuthRule 从 `&""` 改成 `nil` 时：
+1. `cast.ToString(&"") == ""` 且 `cast.ToString(nil) == ""` → 不刷新 AuthToken.Secret
+2. 旧 JWT 的签名密钥 `record.TokenKey() + OLD_Secret == record.TokenKey() + NEW_Secret`（因为 Secret 没变）
+3. `FindAuthRecordByToken` → `ParseJWT` 验签成功 → 返回 record → `e.Auth` 被注入
+4. 旧 Token **完全有效**，继续访问受保护 API，直到自然过期或用户改密码/改邮箱触发 tokenKey 刷新
+
+---
+
+### 不刷新 Secret 的后果与限制
+
+| 维度 | `&""` → `nil` 切换的实际行为 |
+|---|---|
+| **新用户登录** | ✅ 正确拦截：`CanAccessRecord` 返回 false → 无法签发新 Token |
+| **旧 Token 访问普通 API** | ❌ **无法拦截**：验签路径不检查 AuthRule，Secret 没变 → 验签通过 → 请求放行 |
+| **旧 Token 调用 /auth-refresh** | ✅ 正确拦截：刷新走 `recordAuthResponse` → `CanAccessRecord` 返回 false → 403 |
+| **旧 Token 调用 /auth-with-password 重新登录** | ✅ 正确拦截：登录走 `recordAuthResponse` → `CanAccessRecord` 返回 false → 403 |
+| **旧 Token 自然过期** | ✅ 自动失效（exp claim） |
+| **管理员主动吊销** | ❌ 不支持：必须手动改 `AuthToken.Secret`、或者让每个用户改密码、或者等 Token 过期 |
+
+> ⚠️ **安全提示**：如果管理员想通过把 AuthRule 设为 `nil` 来"紧急锁定所有已登录用户"，**这无法做到**——已签发的有效 Token 在过期前仍能正常访问所有受保护 API。真正的紧急吊销手段是手动修改 `Collection.AuthToken.Secret`（比如换一个随机字符串），这样会触发该 Collection 下所有 Token 的签名验证失败。
+
+最初的设计假设是"`nil` 时根本无法登录，所以不会有有效 Token 存在"，但这个假设在 `&""` → `nil` 的方向上不成立——切换前用户已经登录并持有有效 Token。
 
 ---
 
