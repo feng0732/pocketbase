@@ -257,13 +257,14 @@ defer func() {
 3. 重启模式下，还有额外 **3 秒** 等待 execve 完成，期间 HTTP 服务已停止监听但进程仍存活
 4. 最终 execve 替换进程时，所有未完成的连接随旧进程文件描述符被内核释放
 
-#### ResetBootstrapState：核心资源释放
+#### ResetBootstrapState：核心资源释放（仅停止 Cron，不启动 Cron）
 
 [core/base.go#L449-L480](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L449-L480)
 
 ```go
 func (app *BaseApp) ResetBootstrapState() error {
-    app.Cron().Stop()    // ★ 停止 Cron 调度器（含 __pbDBOptimize__ 内置任务）
+    app.Cron().Stop()    // ★ 唯一的 Cron 操作：仅停止调度器
+                         // 不会重新启动 Cron，也不清除已注册的任务
 
     // 关闭所有 DB 连接池
     dbs := []*dbx.Builder{
@@ -279,16 +280,61 @@ func (app *BaseApp) ResetBootstrapState() error {
 }
 ```
 
-Cron 的启动是在 `registerBaseHooks()` 中通过 OnServe hook（Priority 999）完成的，见 [core/base.go#L1350-L1358](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L1350-L1358)：
+**重要**：`ResetBootstrapState()` 对 Cron 只做 `Stop()` 操作，已通过 `app.Cron().Add()` 注册的任务（包括内置的 `__pbDBOptimize__` 和用户通过 JS `cronAdd()` 注册的任务）仍然保留在 Cron 实例的任务列表中，只是调度器不再触发。
+
+#### Cron 生命周期：由 OnServe 钩子统一启动
+
+**Bootstrap() 不负责启动 Cron**。查看 [core/base.go#L391-L443](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L391-L443)，Bootstrap 的 finalizer 仅执行：
+- `ResetBootstrapState()`（内有 Cron().Stop()，但此时 Cron 尚未启动，无操作）
+- 创建数据目录
+- 打开 DB 连接池
+- 初始化日志
+- 运行系统迁移
+- 重新加载 Collection 缓存和 Settings
+- 清理临时目录
+
+**没有任何 Cron().Start() 调用。**
+
+Cron 的启动是在 `registerBaseHooks()` 中通过 **OnServe 钩子**完成的，见 [core/base.go#L1350-L1358](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L1350-L1358)：
 ```go
 app.OnServe().Bind(&hook.Handler[*ServeEvent]{
     Id: "__pbCronStart__",
     Func: func(e *ServeEvent) error {
-        app.Cron().Start()    // ★ 服务启动时启动 Cron
+        app.Cron().Start()    // ★ Cron 唯一的启动时机
         return e.Next()
     },
-    Priority: 999,  // 最晚执行，确保其他初始化完成
+    Priority: 999,  // 高 Priority → 最晚执行，确保路由、DB 等已就绪
 })
+```
+
+Cron 的完整生命周期总结：
+
+```
+进程启动
+   │
+   ▼
+core.NewBaseApp()
+   └── cron = cron.New()           // 创建 Cron 实例，未启动
+   │
+   ▼
+registerBaseHooks()
+   └── 注册 __pbCronStart__ 到 OnServe（Priority 999）
+   │
+   ▼
+用户 cronAdd("job1", ...)         // JS 或 Go 注册任务，存入 Cron 内部列表
+   │
+   ▼
+apis.Serve() → OnServe.Trigger()
+   └── Priority 999: __pbCronStart__
+       └── app.Cron().Start()     // ★ 开始定时调度
+   │
+   ▼ (服务运行中)
+   │
+   ▼
+app.Restart() / 信号终止
+   └── OnTerminate.Trigger() → finalizer
+       └── ResetBootstrapState()
+           └── app.Cron().Stop()  // ★ 停止调度，任务列表保留但不再触发
 ```
 
 #### execve 的平台特定实现与回退机制
@@ -322,7 +368,7 @@ defer func() {
 }()
 ```
 
-`Bootstrap()` 内部会先再次调用 `ResetBootstrapState()`（幂等安全），然后重新：
+`Bootstrap()` 内部会先再次调用 `ResetBootstrapState()`（幂等安全，Cron 再次 Stop），然后重新：
 - 创建数据目录
 - 打开 4 个 DB 连接池（concurrent/nonconcurrent × main/aux）
 - 初始化日志处理器
@@ -330,7 +376,13 @@ defer func() {
 - 重新加载 Collection 缓存和 Settings
 - 清理临时目录
 
-**注意**：这个回退只能恢复 Core App 级别的状态，无法恢复已经被 `server.Shutdown()` 关闭的 HTTP 服务和 Listener——因为 Serve 函数的 defer 会在 Shutdown 后 `wg.Wait()`，如果 execve 失败，进程最终会从 Serve 返回并退出。
+**★ 关键修正**：`Bootstrap()` **不会**启动 Cron，也不会恢复 HTTP 服务。Cron 的启动依赖于 OnServe 钩子的 `__pbCronStart__`，但此时 HTTP Server 已经被 `server.Shutdown()` 关闭，Serve 函数外层的 `wg.Wait()` 会阻塞直到超时，最终 Serve 返回、进程退出。
+
+execve 失败后的实际状态：
+- DB 连接恢复、日志恢复 → Core App 级别功能可用
+- Cron 保持 Stop 状态（因为没有 OnServe 触发 __pbCronStart__）
+- HTTP 服务已关闭、Listener 已关闭 → 无法接收请求
+- 进程最终从 Serve 返回 → pocketbase.go 中再触发一次 OnTerminate → ResetBootstrapState → 退出
 
 #### 新进程启动后的完整重建
 
@@ -340,22 +392,29 @@ execve 成功后，新进程从头执行标准启动流程，旧进程中所有�
 新进程启动
 ├── PocketBase.NewWithConfig()
 │   └── core.NewBaseApp()
-│       ├── initHooks()          // 所有 Hook 实例重新创建（全新的 Handler 列表）
-│       └── registerBaseHooks()  // 系统内置钩子重新绑定
+│       ├── cron = cron.New()       // 全新 Cron 实例，无任务，未启动
+│       ├── initHooks()             // 所有 Hook 实例重新创建（全新 Handler 列表）
+│       └── registerBaseHooks()     // 系统内置钩子重新绑定
+│           ├── 注册 __pbCronStart__ 到 OnServe（Priority 999）
+│           └── 注册内置 Cron 任务 __pbDBOptimize__
 ├── jsvm.Register()
-│   ├── registerMigrations()     // 重新扫描 pb_migrations
+│   ├── registerMigrations()        // 重新扫描 pb_migrations
 │   └── registerHooks()
-│       ├── watchHooks()         // 创建全新的 fsnotify.Watcher
-│       ├── newPool(...)         // 全新的 goja.Runtime 池
-│       ├── 新建 loader VM       // 重新绑定 hooksBinds/routerBinds/cronBinds
+│       ├── watchHooks()            // 创建全新的 fsnotify.Watcher
+│       ├── newPool(...)            // 全新的 goja.Runtime 池
+│       ├── 新建 loader VM          // 重新绑定 hooksBinds/routerBinds/cronBinds
 │       └── 遍历 pb_hooks 重新执行所有 JS 文件
-│           └── 所有 routerAdd/routerUse/on*/cronAdd 重新注册
+│           ├── 所有 routerAdd/routerUse/on* 重新注册
+│           └── 所有 cronAdd 重新调用 app.Cron().Add()
 └── serve 命令 → apis.Serve()
-    ├── Bootstrap()              // 打开 DB、启动 Cron、初始化 notifyWatcher
-    ├── apis.NewRouter()         // 全新 Router + 系统路由
-    ├── OnServe.Trigger()        // 所有 JS 自定义路由重新注入 Router
-    ├── BuildMux()               // 全新 http.ServeMux
-    └── net.Listen + Serve()     // 全新 Listener + HTTP Server
+    ├── Bootstrap()                 // 打开 DB、初始化日志、加载 Settings
+    │                              // ★ Bootstrap 不启动 Cron！
+    ├── apis.NewRouter()            // 全新 Router + 系统路由
+    ├── OnServe.Trigger()           // 按 Priority 执行：
+    │   ├── ... 用户自定义路由注册
+    │   └── Priority 999: __pbCronStart__ → app.Cron().Start()  ★ Cron 在此启动
+    ├── BuildMux()                  // 全新 http.ServeMux
+    └── net.Listen + Serve()        // 全新 Listener + HTTP Server
 ```
 
 #### 完整终止与重启流程图
@@ -395,18 +454,32 @@ OnTerminate.Trigger() 按 Priority 执行
     │
     └── (finalizer) 最后执行
         ├── ResetBootstrapState()
-        │   ├── Cron().Stop()            → 停止所有定时任务
+        │   ├── Cron().Stop()            → ★ 仅停止调度，任务列表保留
         │   └── 关闭 4 个 DB 连接池并置 nil
         │
         ├── defer: execve 失败时 Bootstrap()
-        │   └── 重新打开 DB、重启 Cron 等（HTTP 服务无法恢复）
+        │   └── 重新打开 DB/恢复日志
+        │       ★ Cron 仍保持 Stop（无 OnServe 触发 __pbCronStart__）
+        │       ★ HTTP 服务无法恢复（Server/Listener 已 Shutdown）
         │
         └── execve(execPath, os.Args, os.Environ)
             ├── 成功 → 永不返回，新进程从头启动
-            └── 失败 → 返回 error → 触发 defer Bootstrap() → Serve 返回 → 进程退出
+            └── 失败 → 返回 error → 触发 defer Bootstrap()
+                               → Serve 的 wg.Wait() 结束
+                               → Serve 返回
+                               → pocketbase.go 中再次触发 OnTerminate
+                               → ResetBootstrapState → 进程退出
 
 新进程 (execve 成功)
-    └── 完整启动流程: NewWithConfig → jsvm.Register → Bootstrap → apis.Serve
+    └── 完整启动流程:
+        NewWithConfig
+          → core.NewBaseApp() { cron.New(), initHooks, registerBaseHooks }
+          → jsvm.Register() { registerMigrations, registerHooks → cronAdd 重新注册任务 }
+          → Bootstrap() { 打开 DB，不启动 Cron }
+          → apis.Serve()
+              → OnServe.Trigger()
+                  → Priority 999: __pbCronStart__ { app.Cron().Start() } ★
+              → BuildMux → Listen → Serve
 ```
 
 ---
