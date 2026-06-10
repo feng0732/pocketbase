@@ -213,7 +213,7 @@ func (f *FileField) prependValue(record *Record, toPrepend any) {
     files := f.toSliceValue(record.GetRaw(f.Name))
     prepends := f.toSliceValue(toPrepend)
     if len(prepends) > 0 {
-        files = append(prepends, files...)  // 注意顺序
+        files = append(prepends, files...)
     }
     f.setValue(record, files)
 }
@@ -238,32 +238,95 @@ func (f *FileField) subtractValue(record *Record, toRemove any) {
 }
 ```
 
-**修饰符组合的顺序不确定性示例**：
+### 3.5 FileField 值的两种形态：纯字符串与 `*filesystem.File`
 
-由于 `documents+` 和 `documents-` key 长度相同，处理顺序取决于 Go map 的随机遍历顺序，不保证固定。某些场景下两种顺序会产生不同结果。
+在进入修饰符处理阶段，FileField 的值列表中可能混合两种类型的元素（`core/field_file.go#L775-L797` 的 `extractPlainStrings` 和 `extractUploadableFiles` 区分）：
+
+| 类型 | 来源 | 含义 |
+|------|------|------|
+| `string` | 旧值（DB 中已有）或客户端重新提交的已有文件名 | 引用已存在的文件，只需保存文件名 |
+| `*filesystem.File` | multipart 上传，由 `extractUploadedFiles()` 转换（`apis/record_crud.go#L690-L727`）| 新上传的文件，包含 Reader、原始文件名、已规范化的存储名 |
+
+**关键点**：新上传的 `*filesystem.File` 在 `extractUploadedFiles` 阶段就已经完成了文件名规范化（`tools/filesystem/file.go#L195-L236` 的 `normalizeName()`），文件名格式为 `{cleanName}_{10位随机字符}{.ext}`，不是用户上传时的原始文件名。
+
+### 3.6 修饰符与校验的协作：为什么不能凭空新增纯字符串
+
+`ReplaceModifiers` 阶段只做列表组装，不做安全校验。真正的安全检查在 `FileField.ValidateValue()`（`core/field_file.go#L250-L269`）：
 
 ```
-场景: 追加一个新文件，同时删除同一个新文件名（测试边界情况）
-假设 DB 中 documents = ["a.jpg"]
+核心逻辑:  addedStrings = 新值中的纯字符串 - 旧值中的纯字符串
+
+如果 addedStrings 非空 → 说明有人试图凭空"伪造"一个文件引用 → 报错
+```
+
+这意味着：
+- ✅ `documents- = "old.jpg"` — 合法。删除的是已存在的文件名，不涉及新增
+- ✅ `documents+ = [*filesystem.File]` — 合法。新上传的是 `*File` 类型，会走上传流程
+- ❌ `documents+ = ["made_up.txt"]` — 非法。新增的是纯字符串，不在旧值中，会被 ValidateValue 拒绝
+- ✅ 重新排列已有文件的顺序（纯字符串，但都在旧值中）— 合法
+
+---
+
+### 3.7 修饰符组合的顺序不确定性
+
+`+documents`、`documents+`、`documents-` 三者 key 长度相同（均为 `len(fieldName)+1`），处理顺序取决于 Go map 的随机遍历顺序，**不保证固定**。
+
+#### 场景一：`documents+` 与 `documents-` 组合（真实上传场景）
+
+这是最常见的场景：同时上传新文件并删除旧文件。
+
+```
+假设 DB 中 documents = ["old_a.jpg", "old_b.jpg"]
 
 请求 multipart:
-  documents+  = ["new_c.pdf"]   → 后置追加 new_c.pdf
-  documents-  = "new_c.pdf"     → 删除 new_c.pdf
+  documents+  = [ *filesystem.File{Name: "new_photo_abc123def4.jpg"} ]
+                   新上传文件，文件名已规范化，带随机后缀
+  documents-  = "old_a.jpg"   删除已有旧文件，纯字符串
 
-由于长度相同，存在两种可能的执行路径:
+两种可能的执行顺序，结果一致:
 
-路径 A（先追加后删除）:
-  1. documents+ → ["a.jpg", "new_c.pdf"]
-  2. documents- → ["a.jpg"]             （删除刚追加的 new_c.pdf，成功）
-  结果: ["a.jpg"]
+  先 + 后 -:
+    1. documents+ → ["old_a.jpg", "old_b.jpg", new_photo_abc123def4.jpg]
+    2. documents- → ["old_b.jpg", new_photo_abc123def4.jpg]
 
-路径 B（先删除后追加）:
-  1. documents- → ["a.jpg"]             （new_c.pdf 还不存在，删除为 no-op）
-  2. documents+ → ["a.jpg", "new_c.pdf"]
-  结果: ["a.jpg", "new_c.pdf"]
+  先 - 后 +:
+    1. documents- → ["old_b.jpg"]
+    2. documents+ → ["old_b.jpg", new_photo_abc123def4.jpg]
+
+最终结果相同: ["old_b.jpg", new_photo_abc123def4.jpg]
 ```
 
-> **结论**：当多个相同长度修饰符针对同一字段时，结果可能依赖于 map 遍历顺序，无法确定。对同一字段混合使用追加和删除修饰符时需特别注意。如果需要确定性，请分两次请求提交，或在客户端组装最终列表后直接使用裸字段名 `documents` 一次性提交。
+> **说明**：这个场景下顺序不影响结果，因为追加的新文件名（带随机后缀）和删除的旧文件名不会重叠。虽然结果一致，但处理顺序仍然是不确定的，不能依赖。
+
+#### 场景二：重排 + 删除同一个已有文件（边界场景，结果不确定）
+
+当两个修饰符操作**同一个已有文件**时，执行顺序会影响最终结果。这种情况通常发生在使用纯字符串文件名对已有文件进行重排的场景：
+
+```
+假设 DB 中 documents = ["old_a.jpg", "old_b.jpg"]
+
+请求 body (JSON 或 form):
+  +documents   = ["old_b.jpg"]    把已有文件移到最前面（头插）
+  documents-   = "old_b.jpg"      删除已有文件
+
+两种可能的执行顺序，结果不同:
+
+  先 +documents 后 documents-:
+    1. +documents  → ["old_b.jpg", "old_a.jpg", "old_b.jpg"]   （有重复）
+    2. documents-  → ["old_a.jpg"]                              （删除所有 old_b.jpg）
+    结果: ["old_a.jpg"]
+
+  先 documents- 后 +documents:
+    1. documents-  → ["old_a.jpg"]                              （删除 old_b.jpg）
+    2. +documents  → ["old_b.jpg", "old_a.jpg"]                 （头插 old_b.jpg）
+    结果: ["old_b.jpg", "old_a.jpg"]
+```
+
+> **说明**：`+documents = ["old_b.jpg"]` 中的 `old_b.jpg` 是纯字符串，但它在旧值中已存在，因此**不会**被 `ValidateValue` 拒绝（只拦"新增的"纯字符串，不拦已有的）。
+
+> **实践建议**：
+> - 真实场景中 `documents+`（新上传 `*File`）+ `documents-`（删旧文件字符串）的组合最常见，由于新旧文件名不重叠（新文件有随机后缀），结果通常一致，但顺序仍然是不确定的，不能依赖。
+> - 对同一字段混合使用多个相同长度的修饰符时需谨慎。如果需要确定的行为，请在客户端组装完整列表后，直接使用裸字段名 `documents` 一次性提交。
 
 ---
 
