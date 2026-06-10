@@ -479,38 +479,113 @@ app.OnRealtimeSubscribeRequest().BindFunc(func(e *core.RealtimeSubscribeRequestE
 
 ## 四、握手写入失败与事件写入失败的退出清理
 
-### 4.1 核心清理机制概览
+### 4.1 核心清理机制概览：按代码执行顺序渐进注册的 defer
 
-SSE 连接的所有退出路径最终都会走到同一个 **defer 清理链**，该链在 [realtimeConnect](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L57-L81) 中建立：
+**重要修正**：与之前总述「所有退出路径走同一个 defer 链」不同，实际代码中 defer 是按执行顺序**逐行注册**的，不同退出路径注册的 defer 数量和清理范围完全不同。不存在「统一的 defer 清理链」。
+
+以下按 [realtimeConnect](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L43-L166) 的**实际代码执行顺序**，逐段标注 defer 的注册点和对应的清理范围：
 
 ```go
-cancelCtx, cancelRequest := context.WithCancel(e.Request.Context())
-defer cancelRequest()                 // 第 1 层：取消请求上下文
-e.Request = e.Request.Clone(cancelCtx)
+func realtimeConnect(e *core.RequestEvent) error {
+    // ┌─────────────────────────────────────────────────────────┐
+    // │ 阶段 0：SetWriteDeadline 检查                            │
+    // │ 位置：realtime.go:47-49                                  │
+    // │ 注册的 defer：0 个                                       │
+    // │ 若此处返回 error（非 ErrNotSupported）：                  │
+    // │   → 无任何资源需要清理（尚未创建 context/Client/Timer）    │
+    // └─────────────────────────────────────────────────────────┘
+    writeDeadlineErr := rc.SetWriteDeadline(time.Time{})
+    if writeDeadlineErr != nil {
+        if !errors.Is(writeDeadlineErr, http.ErrNotSupported) {
+            return e.InternalServerError(...)  // ← 极早期返回：0 个 defer
+        }
+    }
 
-return e.App.OnRealtimeConnectRequest().Trigger(connectEvent, func(ce *RealtimeConnectRequestEvent) error {
-    ce.App.SubscriptionsBroker().Register(ce.Client)
-    defer func() {
-        e.App.SubscriptionsBroker().Unregister(ce.Client.Id())  // 第 2 层：Broker 注销
-    }()
-    // ... 消息循环 ...
-})
+    // ┌─────────────────────────────────────────────────────────┐
+    // │ 阶段 1：注册 DEFER-A                                      │
+    // │ 位置：realtime.go:58                                      │
+    // │ 注册的 defer：1 个（cancelRequest）                       │
+    // │ 若在此之后、钩子触发之前返回：                              │
+    // │   → 仅执行 cancelRequest()                                │
+    // │   → Client 对象已创建但未注册，由 GC 回收                  │
+    // └─────────────────────────────────────────────────────────┘
+    cancelCtx, cancelRequest := context.WithCancel(e.Request.Context())
+    defer cancelRequest()                          // DEFER-A ✅ 已注册
+    e.Request = e.Request.Clone(cancelCtx)
+
+    // ... 设置响应头、创建 Client 对象、设置 IP ...
+    // Client 对象在此处创建（realtime.go:71），但尚未注册到 Broker
+
+    // ┌─────────────────────────────────────────────────────────┐
+    // │ 阶段 2：触发 OnRealtimeConnectRequest 钩子链              │
+    // │                                                           │
+    // │ 分支 2a：用户钩子在 e.Next() 之前返回 error               │
+    // │   → 内嵌 Action 永不执行，DEFER-B/C/D 永不注册            │
+    // │   → 清理范围：仅 DEFER-A (cancelRequest)                  │
+    // │                                                           │
+    // │ 分支 2b：用户钩子调用 e.Next()，进入内嵌 Action            │
+    // │   → 继续执行阶段 3                                        │
+    // └─────────────────────────────────────────────────────────┘
+    return e.App.OnRealtimeConnectRequest().Trigger(connectEvent,
+        func(ce *core.RealtimeConnectRequestEvent) error {
+            // ┌─────────────────────────────────────────────────┐
+            // │ 阶段 3：注册 DEFER-B                               │
+            // │ 位置：realtime.go:78-81                           │
+            // │ 注册的 defer：2 个（DEFER-A + DEFER-B）            │
+            // │ 若在此之后、定时器创建前返回：                      │
+            // │   → 执行顺序（LIFO）：DEFER-B → DEFER-A           │
+            // │   → 即 Broker.Unregister → cancelRequest          │
+            // └─────────────────────────────────────────────────┘
+            ce.App.SubscriptionsBroker().Register(ce.Client)
+            defer func() {
+                e.App.SubscriptionsBroker().Unregister(ce.Client.Id())  // DEFER-B ✅ 已注册
+            }()
+
+            // ... 发送 PB_CONNECT（可能在此写入失败并返回 nil） ...
+
+            // ┌─────────────────────────────────────────────────┐
+            // │ 阶段 4：注册 DEFER-C / DEFER-D                    │
+            // │ 位置：realtime.go:89-90                           │
+            // │ 注册的 defer：4 个（DEFER-A + B + C + D）         │
+            // │ 之后的所有退出路径均执行完整 defer 链：             │
+            // │   DEFER-D(idleTimer.Stop)                         │
+            // │     → DEFER-C(maxTimer.Stop)                      │
+            // │       → DEFER-B(Broker.Unregister)                │
+            // │         → DEFER-A(cancelRequest)                  │
+            // └─────────────────────────────────────────────────┘
+            maxTimer := time.NewTimer(ce.MaxTimeout)
+            defer maxTimer.Stop()         // DEFER-C ✅ 已注册
+            idleTimer := time.NewTimer(ce.IdleTimeout)
+            defer idleTimer.Stop()        // DEFER-D ✅ 已注册
+
+            // for-select 消息循环：所有退出路径均走完整的 4 个 defer
+        })
+}
 ```
 
-两层 defer 的执行顺序为 **LIFO**（后进先出）：函数返回时先执行 `Broker.Unregister()`，再执行 `cancelRequest()`。
+**各阶段退出路径的 defer 清理范围对照表**：
 
-`Broker.Unregister()` 的内部实现见 [broker.go:58-65](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/tools/subscriptions/broker.go#L58-L65)：
+| 退出发生的阶段 | 代码位置 | 已注册 defer | LIFO 执行顺序 |
+|---------------|----------|-------------|---------------|
+| SetWriteDeadline 失败（非 ErrNotSupported） | [realtime.go:47-49](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L47-L49) | 0 个 | 无 |
+| 钩子 e.Next() 之前返回 error | 用户自定义 Handler | DEFER-A | `cancelRequest()` |
+| 内嵌 Action 中、定时器创建前返回（如 PB_CONNECT 写入失败） | [realtime.go:100-107](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L100-L107) | DEFER-A + B | `Broker.Unregister` → `cancelRequest` |
+| 定时器创建后任何退出（事件写入失败/超时/客户端断开） | [realtime.go:120-163](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L120-L163) | DEFER-A + B + C + D | `idleTimer.Stop` → `maxTimer.Stop` → `Broker.Unregister` → `cancelRequest` |
+
+**`Broker.Unregister()` 的内部实现**见 [broker.go:58-65](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/tools/subscriptions/broker.go#L58-L65)，执行两步原子操作：
 
 ```go
 func (b *Broker) Unregister(clientId string) {
     client := b.store.Get(clientId)
     if client == nil {
-        return
+        return                          // 幂等：未注册则直接返回
     }
     client.Discard()          // ① 关闭 channel，标记 isDiscarded=true
     b.store.Remove(clientId)  // ② 从全局注册表移除
 }
 ```
+
+其中 [DefaultClient.Discard](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/tools/subscriptions/client.go#L252-L263) 使用 `sync.Once` 保证 `close(channel)` 的幂等性。
 
 ### 4.2 握手（PB_CONNECT）写入失败的清理流程
 
