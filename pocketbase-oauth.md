@@ -299,22 +299,46 @@ return e.App.OnRecordAuthWithOAuth2Request().Trigger(event, func(e *core.RecordA
 
 ---
 
-### 门禁 7：AuthRule 校验（会话返回前最后一道闸）
+### 门禁 7：RecordAuthResponse 会话返回阶段（内部 8 步）
 
-账号绑定成功后，进入会话生成阶段 `RecordAuthResponse`，此时会执行 **AuthRule 校验**——确保该用户满足集合定义的认证规则。
+账号绑定成功后，进入统一会话出口 `RecordAuthResponse`。这是所有认证方式（password / oauth2 / otp / refresh）共用的路径，内部按严格顺序执行 **8 个步骤**，任何一步失败都会提前返回错误响应，但 token 在第 1 步就已生成。
 
-**调用链**：
+> ⚠️ **核心事实**：`token` 先生成，AuthRule、MFA 等校验在其后执行。即使后续校验失败（AuthRule 不通过、IP 不在白名单、MFA 要求二次认证），JWT token 也已在内存中签发完毕——只是不会写入 HTTP 响应返回给客户端。
+
+#### 会话返回阶段内部执行顺序
+
 ```
-RecordAuthResponse
-  └─ recordAuthResponse (apis/record_helpers.go:45)
-       └─ e.App.CanAccessRecord(authRecord, requestInfo, authRecord.Collection().AuthRule)
+RecordAuthResponse(e, authRecord, "oauth2", {OAuth2User, IsNewRecord})
+│
+├─ ① 生成 auth token                       ← 最先执行，失败直接 500
+│     authRecord.NewAuthToken()
+│
+└─ recordAuthResponse(e, authRecord, token, authMethod, meta)
+      │
+      ├─ ② 超级用户 IP 白名单校验           ← 仅 _superusers 集合生效
+      │     SuperuserIPs 非空时严格匹配 e.RealIP()
+      │
+      ├─ ③ AuthRule 校验                    ← CanAccessRecord
+      │
+      ├─ ④ OnRecordAuthRequest 事件钩子
+      │   └─ 钩子回调内（开发者 Written() 可提前返回）
+      │        │
+      │        ├─ ⑤ MFA 检查               ← 需要时返回 401 + mfaId
+      │        │
+      │        ├─ ⑥ 响应富化                ← Unhide / IgnoreEmailVisibility / expand
+      │        │
+      │        ├─ ⑦ 登录告警 AuthAlert      ← 新设备指纹发邮件
+      │        │
+      │        └─ ⑧ 最终响应 JSON           ← HTTP 200 {token, record, meta}
 ```
+
+#### ③ AuthRule 校验详解
 
 `CanAccessRecord` 的实现位于 `core/record_query.go` 第 599-639 行：
 
 ```go
 func (app *BaseApp) CanAccessRecord(record *Record, requestInfo *RequestInfo, accessRule *string) (bool, error) {
-    // 超级用户直接放行
+    // 超级用户在 requestInfo 层面直接放行（但 IP 白名单已在第②步单独校验）
     if requestInfo.HasSuperuserAuth() {
         return true, nil
     }
@@ -345,7 +369,8 @@ func (app *BaseApp) CanAccessRecord(record *Record, requestInfo *RequestInfo, ac
 | `""`（空字符串） | 不设额外限制，任何该集合用户只要通过凭证校验即可登录 |
 | `"verified = true"` 等表达式 | 必须满足过滤规则才能登录（典型用例：只允许已验证邮箱的用户认证） |
 
-校验不通过时直接返回 `403 Forbidden`，不会生成 token：
+校验不通过时直接返回 `403 Forbidden`（token 已生成但不返回）：
+
 ```go
 ok, err := e.App.CanAccessRecord(authRecord, originalRequestInfo, authRecord.Collection().AuthRule)
 if !ok {
@@ -354,6 +379,10 @@ if !ok {
 ```
 
 **代码位置**：`apis/record_helpers.go` 第 58-61 行
+
+> 💡 **注意**：这里传入的 `originalRequestInfo` 是**认证前**的请求上下文（`requestInfo.Auth` 仍为空或为旧登录态），确保 AuthRule 不会被当前正登录的用户身份 "self-fulfilling"。
+
+关于会话返回阶段的 8 步完整详解（含 MFA、响应富化、AuthAlert 等），见第六节「Token 生成与会话落地全链路」。
 
 ---
 
