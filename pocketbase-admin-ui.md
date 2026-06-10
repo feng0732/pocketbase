@@ -554,120 +554,310 @@ func (e *Event) FileFS(fsys fs.FS, filename string) error {
 
 ---
 
-## 八、阶段 7：UI 扩展机制
+## 八、阶段 7：UI 扩展机制（动态路径）
 
 PocketBase 支持在运行时通过插件注入额外的 UI 资源，由 [apis/extensions.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go) 实现。
 
-### 8.1 扩展资源路由
+与嵌入的 dist 静态资源不同，扩展路由有两条完全不同的处理链路：
+- **动态合并脚本** `/_/extensions.js`：每次请求动态拼接所有扩展的 main.js
+- **扩展自有静态资源** `/_/extensions/{name}/{path...}`：每个扩展独立的 Static 路由
+
+### 8.1 路由注册时序（关键：OnServe Hook）
+
+扩展路由**不是**在 `NewRouter()` 时立即注册，而是通过绑定 OnServe Hook 延迟到服务启动时注册。完整时序：
+
+```
+[cmd/serve.go → Serve()]
+   │
+   ├── 1. NewRouter(app)
+   │       │
+   │       └── bindUIExtensions(app)
+   │             │
+   │             └── app.OnServe().Bind({Priority: 9999, Func: ...})
+   │                    ↑ 仅仅是绑定 Hook，并不真正注册路由
+   │
+   ├── 2. pbRouter.GET("/_/{path...}", Static(ui.DistDirFS, false))
+   │       ↑ 在 OnServe 之前先注册 dist 的通配符路由
+   │
+   └── 3. app.OnServe().Trigger(serveEvent, func(e) {
+             │
+             ├── Hook 链执行（Priority 9999 最后执行）
+             │       │
+             │       └── bindUIExtensions 的 Func 被调用
+             │             │
+             │             ├── uiGroup = se.Router.Group("/_")
+             │             │       ↑ 创建 /_ 子路由组
+             │             │
+             │             ├── for ext in UIExtensions:
+             │             │     uiGroup.GET("/extensions/"+ext.Name+"/{path...}", Static(ext.FS, false))
+             │             │
+             │             └── uiGroup.GET("/extensions.js", 匿名处理器)
+             │
+             └── e.Router.BuildMux()
+                   ↑ 此时所有路由（含扩展）都已注册，编译为最终 http.ServeMux
+         })
+```
+
+由于 Go 1.22+ `http.ServeMux` 的"最具体匹配优先"规则：
+- `/_/extensions.js`（精确路径）优先于 `/_/{path...}`（通配符）匹配
+- `/_/extensions/ext1/{path...}`（更具体前缀）优先于 `/_/{path...}` 匹配
+
+### 8.2 扩展资源路由（Static 处理器）
+
+每个扩展通过 `Static(ext.FS, false)` 注册独立静态路由：
 
 ```go
-func bindUIExtensions(app core.App) {
-    if ui.DistDirFS == nil {
-        return
+// apis/extensions.go:42-49
+for _, ext := range se.UIExtensions {
+    if ext.Name == "" || ext.FS == nil {
+        se.App.Logger().Debug("Invalid UI extension configuration", slog.Any("extension", ext))
+        continue
     }
-
-    app.OnServe().Bind(&hook.Handler[*core.ServeEvent]{
-        Priority: 9999, // 尽可能靠后执行
-        Func: func(se *core.ServeEvent) error {
-            uiGroup := se.Router.Group("/_").
-                Bind(缓存控制 + CSP + Gzip)
-
-            // 每个扩展注册独立路由：/_/extensions/{name}/{path...}
-            for _, ext := range se.UIExtensions {
-                uiGroup.GET("/extensions/"+ext.Name+"/{path...}", Static(ext.FS, false))
-            }
-
-            // 合并所有扩展的 main.js
-            uiGroup.GET("/extensions.js", func(re *core.RequestEvent) error {
-                buf := new(bytes.Buffer)
-                for _, ext := range se.UIExtensions {
-                    // 将每个扩展的 main.js 包装在 (async function(){ ... })(); 中
-                    _ = copyExtensionMainjs(buf, ext)
-                }
-                return re.Stream(200, "text/javascript", buf)
-            })
-
-            return se.Next()
-        },
-    })
+    // 路径模式：/_/extensions/{name}/{path...}
+    // 文件来源：ext.FS（运行时由插件提供的 fs.FS，非 Go embed）
+    uiGroup.GET("/extensions/"+ext.Name+"/{path...}", Static(ext.FS, false))
 }
 ```
 
-### 8.2 main.js 合并策略
+**与 dist 静态资源的异同**：
+- 相同点：都使用 `Static()` 处理器，都有 `indexFallback=false`，都走 `fs.Stat → e.FileFS → http.ServeContent`
+- 不同点：
+  - dist 资源使用 `ui.DistDirFS`（编译时 embed），扩展资源使用 `ext.FS`（运行时注入，可以是任意 fs.FS 实现）
+  - dist 路由模式 `/_/{path...}`，扩展路由模式 `/_/extensions/{name}/{path...}`（多一层 name 命名空间）
 
-为避免多个扩展的全局作用域冲突，每个扩展的 `main.js` 被包装：
+### 8.3 动态合并脚本 `/_/extensions.js`（非 Static 处理器！）
 
-```js
-await (async function(){
-    /* ... 扩展的 main.js 原始内容 ... */
-})();
+这是与 dist 静态资源**完全不同**的处理链路——不走 `Static()`，而是一个独立的匿名处理器：
+
+```go
+// apis/extensions.go:52-66
+uiGroup.GET("/extensions.js", func(re *core.RequestEvent) error {
+    buf := new(bytes.Buffer)
+
+    // ★ 每次请求都重新遍历所有扩展，重新读取并合并
+    // note: don't cache in memory to allow previewing changes without restart
+    for _, ext := range se.UIExtensions {
+        err := copyExtensionMainjs(buf, ext)
+        if err != nil {
+            return re.InternalServerError("An error occurred while generating the main.js extension file", err)
+        }
+    }
+
+    return re.Stream(200, "text/javascript", buf)
+}).Bind(SkipSuccessActivityLog())
 ```
 
-使用 `await` 是为了支持顶层 `await` 语句。前端在 [ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js#L137-L147) 中加载 `/_/extensions.js`。
+### 8.4 `copyExtensionMainjs` 合并策略
+
+[apis/extensions.go:72-95](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go#L72-L95)：
+
+```go
+func copyExtensionMainjs(buf *bytes.Buffer, ext core.UIExtension) error {
+    f, err := ext.FS.Open("main.js")
+    if err != nil {
+        if errors.Is(err, os.ErrNotExist) {
+            return nil // 扩展没有 main.js 就跳过，不报错
+        }
+        return fmt.Errorf("[UI extension %q] main.js open error: %w", ext.Name, err)
+    }
+    defer f.Close()
+
+    // 每个扩展的 main.js 被独立的 async IIFE 包裹，避免作用域冲突
+    // await/async 用于支持扩展使用顶层 await
+    _, _ = buf.WriteString("await (async function(){")
+    _, err = io.Copy(buf, f)
+    _, _ = buf.WriteString("})();")
+
+    return err
+}
+```
+
+合并后的响应内容示例（来自测试 [apis/extensions_test.go:75](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions_test.go#L75)）：
+
+```js
+await (async function(){ext1_main})();await (async function(){ext3_main})();
+```
+
+### 8.5 前端加载时机
+
+[ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js#L137-L147)：
+
+```js
+try {
+    await import(app.pb.buildURL("/_/extensions.js"));
+    //   ↑ 动态 import 加载合并后的扩展脚本
+} catch (_) {}
+
+// 扩展加载完成后，标记 store 就绪，触发路由初始化
+app.store._ready = true;
+```
 
 ---
 
-## 九、完整调用时序图（以 `/_/#/collections` 为例）
+## 九、阶段 8：嵌入静态资源 vs 动态扩展脚本——处理路径对比
+
+### 9.1 三条资源处理链路总览
+
+Admin UI 挂载在 `/_/` 下，但实际有三条不同的处理链路：
+
+| 链路 | 典型 URL | 处理器 | 文件来源 | 注册时机 | 注册位置 |
+|------|---------|--------|---------|---------|---------|
+| **A. 嵌入 dist 静态资源** | `/_/assets/...`<br>`/_/libs/...`<br>`/_/index.html` | `Static(ui.DistDirFS, false)` | Go embed 编译时嵌入 `ui/dist/` | Serve() 中（OnServe 之前） | [apis/serve.go:83](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/serve.go#L83) |
+| **B. 扩展静态资源** | `/_/extensions/ext1/test.txt` | `Static(ext.FS, false)` | 运行时注入的 `ext.FS`（每个扩展独立） | OnServe Hook（Priority 9999） | [apis/extensions.go:48](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go#L48) |
+| **C. 动态合并脚本** | `/_/extensions.js` | **匿名函数**（非 Static！） | 运行时遍历所有扩展，逐个读 `main.js` 动态拼接 | OnServe Hook（Priority 9999） | [apis/extensions.go:54-65](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go#L54-L65) |
+
+### 9.2 链路 A vs 链路 C：逐行代码对比
+
+| 对比维度 | 链路 A：`/_/assets/index-xxx.js` | 链路 C：`/_/extensions.js` |
+|---------|-------------------------------|--------------------------|
+| **路由模式** | `GET /_/{path...}`（通配符） | `GET /_/extensions.js`（精确匹配） |
+| **处理器函数** | `Static(ui.DistDirFS, false)` 返回的闭包 | 内联匿名函数 `func(re *core.RequestEvent) error {...}` |
+| **文件存在性检查** | `fs.Stat(fsys, "assets/index-xxx.js")` —— 精确查找文件 | 无检查——直接创建空 Buffer，逐个扩展尝试打开 main.js |
+| **文件读取方式** | `fsys.Open(filename)` 一次性打开 | 循环中 `ext.FS.Open("main.js")` 每个扩展各打开一次 |
+| **目录处理** | 目录自动拼接 `index.html` | 不涉及目录概念（始终输出一个合并后的 JS 文件） |
+| **重定向逻辑** | 检查是否以 `/` 结尾、是否为 `index.html`，必要时 301 | 无重定向 |
+| **SPA Fallback** | `indexFallback=false` → 404 | 不适用 |
+| **内容发送方式** | `e.FileFS()` → `http.ServeContent()`（支持 Range、协商缓存、Content-Type 推断） | `re.Stream(200, "text/javascript", buf)`（直接输出 Buffer，Content-Type 固定） |
+| **内存缓存** | 文件在编译时嵌入二进制（随程序启动常驻内存） | **每次请求重新读取并合并**（注释明确 "don't cache in memory to allow previewing changes without restart"） |
+| **成功日志** | Static 内部 `e.Set(requestEventKeySkipSuccessActivityLog, true)` | 显式 `.Bind(SkipSuccessActivityLog())` |
+| **缓存头中间件** | 路由级别：`path != ""` 才设置 Cache-Control | 组级别 uiGroup：无条件设置 Cache-Control（非 dev 时） |
+
+### 9.3 扩展相关 URL 访问场景表
+
+| URL | path 通配符匹配 | 命中链路 | 行为 | HTTP 状态 |
+|-----|----------------|---------|------|----------|
+| `/_/extensions.js` | N/A（精确匹配优先） | 链路 C | 遍历所有扩展，动态合并 main.js，以 text/javascript 输出 | 200 |
+| `/_/extensions.js`（无扩展） | N/A | 链路 C | 返回空 Buffer（Content-Length: 0） | 200 |
+| `/_/extensions.js`（`ui.DistDirFS=nil`，即 no_ui） | N/A | 无路由注册 → 404 | bindUIExtensions 直接 return | 404 |
+| `/_/extensions/ext1/test.txt`（ext1 存在） | path="test.txt"（在 ext1 组内） | 链路 B | `Static(ext1.FS, false)` → 查 ext1.FS 中的 "test.txt" → 存在则发送 | 200 |
+| `/_/extensions/ext1/test.txt`（无任何扩展） | N/A | 无路由注册 → 回退到链路 A | 链路 A path="extensions/ext1/test.txt" → fs.Stat 不存在 → 404 | 404 |
+| `/_/extensions/ext1/missing.txt`（ext1 存在） | path="missing.txt" | 链路 B | `fs.Stat(ext1.FS, "missing.txt")` 不存在 → indexFallback=false → 404 | 404 |
+| `/_/extensions/ext2%20with%20spaces/test.txt` | path="test.txt" | 链路 B | 扩展名 "ext2 with spaces" 经 URL 解码后匹配 → Static 正常处理 | 200 |
+
+---
+
+## 十、阶段 9：完整时序图
+
+### 10.1 时序图 A：`/_/#/collections` 页面加载（含 extensions.js）
 
 ```
 用户在浏览器输入 http://127.0.0.1:8090/_/#/collections
         │
-        │  浏览器行为：hash 部分 #/collections 不发送到服务器
+        │  hash 不发服务器
         ▼
-[HTTP 请求] GET /_/
+[HTTP 1] GET /_/
+        │
+        ├─ 匹配路由 A: GET /_/{path...}
+        │   PathValue("path") = ""
+        │
+        ├─ 链路 A：Static(ui.DistDirFS, false)
+        │   ├── filename = ""
+        │   ├── fs.Stat → 根目录
+        │   └── FileFS → 拼接 index.html → http.ServeContent
+        │
+        │   响应头：无 Cache-Control（path 为空），有 CSP
+        │   响应体：index.html
+        ▼
+浏览器收到 index.html，解析资源引用
+        │
+        ├── <script src="./assets/index-V68uRsWE.js">
+        │       → 解析为 GET /_/assets/index-V68uRsWE.js
+        │
+        ├── <script src="./libs/shablon/shablon.iife.js">
+        │       → 解析为 GET /_/libs/shablon/shablon.iife.js
+        │
+        └── <link rel="stylesheet" href="./assets/index-BkwjA9HK.css">
+                → 解析为 GET /_/assets/index-BkwjA9HK.css
         │
         ▼
-[Go http.ServeMux 路由匹配] 匹配模式 "GET /_/{path...}"
-  PathValue("path") = ""（空字符串）
+[HTTP 2~N] GET /_/assets/index-V68uRsWE.js 等资源请求
+        │
+        ├─ 仍匹配链路 A：GET /_/{path...}
+        │   PathValue("path") = "assets/index-V68uRsWE.js"
+        │
+        ├─ Static 处理：
+        │   ├── fs.Stat(fsys, "assets/index-V68uRsWE.js") → 存在
+        │   └── FileFS → http.ServeContent
+        │
+        │   响应头：Cache-Control: max-age=1209600（path 非空）
+        ▼
+浏览器执行 JS，main.js 启动
+        │
+        └── 动态 import: await import(app.pb.buildURL("/_/extensions.js"))
+                → GET /_/extensions.js
         │
         ▼
-[缓存控制中间件] path == "" → 不设置 Cache-Control（HTML 不缓存）
-                  设置 Content-Security-Policy
+[HTTP N+1] GET /_/extensions.js
+        │
+        ├─ 精确匹配优先 → 命中链路 C（非 Static！）
+        │
+        ├─ 动态处理器执行：
+        │   ├── buf = new(bytes.Buffer)
+        │   ├── for ext in [ext1, ext2, ...]:
+        │   │     ├── copyExtensionMainjs(buf, ext)
+        │   │     │   ├── ext.FS.Open("main.js")
+        │   │     │   ├── buf.WriteString("await (async function(){")
+        │   │     │   ├── io.Copy(buf, f)
+        │   │     │   └── buf.WriteString("})();")
+        │   │     └── （不存在 main.js 则跳过）
+        │   └── re.Stream(200, "text/javascript", buf)
+        │
+        │   响应头：uiGroup 中间件设置 Cache-Control（非 dev）
+        │   响应体：await (async function(){ext1_main})();await (async function(){ext3_main})();
+        ▼
+扩展脚本执行完成
+        │
+        ├── app.store._ready = true
+        ├── initRouter() 被调用
+        ├── window.location.hash = "#/collections"
+        └── Shablon router 渲染集合列表页 ✓
+```
+
+### 10.2 时序图 B：`/_/extensions/ext1/test.txt` 扩展静态资源
+
+```
+GET /_/extensions/ext1/test.txt
+        │
+        ├─ 路由匹配：
+        │   模式1: GET /_/extensions/ext1/{path...}（链路 B，更具体 → 优先）
+        │   模式2: GET /_/{path...}（链路 A，被跳过）
+        │
+        │   PathValue("path") = "test.txt"
+        │
+        ├─ 链路 B：Static(ext1.FS, false)
+        │   ├── filename = "test.txt"
+        │   ├── fs.Stat(ext1.FS, "test.txt") → 存在
+        │   └── FileFS → http.ServeContent
+        │
+        │   响应头：uiGroup 中间件设置 Cache-Control + CSP
+        │   响应体：ext1/test.txt 的内容（如 "ext1_txt"）
+        ▼
+200 OK ✓
+```
+
+### 10.3 时序图 C：`/_/collections`（非 hash，404 场景）
+
+```
+GET /_/collections（注意：没有 #）
+        │
+        ├─ 路由匹配：
+        │   无更具体模式 → 命中链路 A：GET /_/{path...}
+        │   PathValue("path") = "collections"
+        │
+        ├─ 链路 A：Static(ui.DistDirFS, false)
+        │   ├── filename = "collections"
+        │   ├── fs.Stat(ui.DistDirFS, "collections") → 不存在
+        │   ├── indexFallback == false → 不回退到 index.html
+        │   └── return router.ErrFileNotFound
         │
         ▼
-[Gzip 中间件] 根据 Accept-Encoding 决定是否压缩
-        │
-        ▼
-[Static 处理器 (indexFallback=false)]
-  ├── filename = filepath.Clean("") = ""
-  ├── fs.Stat(fsys, "") → 根目录，fi.IsDir() = true
-  ├── URL "/_/" 已以 "/" 结尾 → 不重定向
-  └── e.FileFS(fsys, "")
-        │
-        ▼
-[FileFS]
-  ├── fsys.Open("") → 打开根目录
-  ├── fi.IsDir() == true
-  ├── filename = filepath.Join("", "index.html") = "index.html"
-  ├── fsys.Open("index.html") → 成功
-  └── http.ServeContent(...) → 发送 HTML，200 OK
-        │
-        ▼
-[浏览器解析 HTML]
-  ├── 发现 <script src="./assets/index-V68uRsWE.js">
-  ├── 当前页面 URL = http://host:8090/_/（目录）
-  ├── 相对路径解析: ./assets/index-V68uRsWE.js → /_/assets/index-V68uRsWE.js
-  └── 浏览器发起 GET /_/assets/index-V68uRsWE.js
-        │
-        ▼
-[资源请求] GET /_/assets/index-V68uRsWE.js
-  PathValue("path") = "assets/index-V68uRsWE.js"
-  fs.Stat() → 文件存在
-  缓存中间件：path != "" → 设置 Cache-Control: max-age=1209600
-  http.ServeContent → 发送 JS 文件，200 OK
-        │
-        ▼
-[前端 JS 执行]
-  ├── 加载 /_/extensions.js（扩展脚本）
-  ├── app.store._ready = true
-  ├── initRouter() 被调用
-  ├── window.location.hash = "#/collections"
-  └── 路由匹配成功，渲染集合列表页面
+404 Not Found ❌
+（用户应访问 /_/#/collections，hash 路由由前端处理）
 ```
 
 ---
 
-## 十、关键文件索引
+## 十一、关键文件索引
 
 | 文件 | 职责 |
 |------|------|
