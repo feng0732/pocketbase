@@ -211,9 +211,258 @@ realtimeSetSubscriptions()
 
 ---
 
-## 三、握手写入失败与事件写入失败的退出清理
+## 三、连接请求钩子提前返回错误的清理边界分析
 
-### 3.1 核心清理机制概览
+### 3.1 defer 清理链的分层结构
+
+[realtimeConnect](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L43-L166) 函数中的 defer 不是同一个作用域注册的，而是分布在 **两个不同层级**。理解这一点是分析清理边界的关键：
+
+```go
+func realtimeConnect(e *core.RequestEvent) error {
+    // ========== 层级 0：钩子触发之前 ==========
+    writeDeadlineErr := rc.SetWriteDeadline(time.Time{})
+    if writeDeadlineErr != nil {
+        if !errors.Is(writeDeadlineErr, http.ErrNotSupported) {
+            return e.InternalServerError(...)  // ← 极早期返回，无任何 defer 注册
+        }
+    }
+
+    cancelCtx, cancelRequest := context.WithCancel(e.Request.Context())
+    defer cancelRequest()                          // DEFER-A: 最外层作用域，最后执行
+    e.Request = e.Request.Clone(cancelCtx)
+
+    // ... 设置响应头、创建 Client 对象、设置 IP ...
+
+    return e.App.OnRealtimeConnectRequest().Trigger(connectEvent,
+        func(ce *core.RealtimeConnectRequestEvent) error {  // ← 内嵌 Action Handler
+            // ========== 层级 1：钩子链最末端的内嵌 Action ==========
+            ce.App.SubscriptionsBroker().Register(ce.Client)
+            defer func() {
+                e.App.SubscriptionsBroker().Unregister(ce.Client.Id())  // DEFER-B
+            }()
+
+            // ... 发送 PB_CONNECT ...
+
+            maxTimer := time.NewTimer(ce.MaxTimeout)
+            defer maxTimer.Stop()         // DEFER-C
+
+            idleTimer := time.NewTimer(ce.IdleTimeout)
+            defer idleTimer.Stop()        // DEFER-D
+
+            // ... for-select 消息循环 ...
+        })
+}
+```
+
+**defer 执行顺序（LIFO 后进先出）**：
+
+| defer | 注册作用域 | 执行顺序（函数返回时） | 作用 |
+|-------|-----------|----------------------|------|
+| DEFER-D `idleTimer.Stop()` | 内嵌 Action | 第 1 个执行 | 释放空闲定时器 |
+| DEFER-C `maxTimer.Stop()` | 内嵌 Action | 第 2 个执行 | 释放最大生命周期定时器 |
+| DEFER-B `Broker.Unregister()` | 内嵌 Action | 第 3 个执行 | 注销 Client + Discard channel |
+| DEFER-A `cancelRequest()` | 外层函数 | 第 4 个执行（最后） | 取消请求上下文 |
+
+> **核心差异**：DEFER-B/C/D 只有在 **内嵌 Action 被实际执行** 时才会被注册。如果用户钩子在 `e.Next()` 之前返回错误，这三个 defer 永远不会执行；而 DEFER-A 无论如何都会执行。
+
+### 3.2 Hook 错误传播机制
+
+PocketBase 的 Hook 采用洋葱模型，错误会沿着 Handler 调用链 **原路返回**。核心逻辑在 [hook.go:164-173](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/tools/hook/hook.go#L164-L173)：
+
+```go
+for i := len(handlers) - 1; i >= 0; i-- {
+    old := event.nextFunc()
+    event.setNextFunc(func() error {
+        event.setNextFunc(old)
+        return handlers[i](event)   // ← 每个 handler 的 return 值就是上一层 e.Next() 的返回值
+    })
+}
+return event.Next()  // ← 整个 Trigger 的返回值就是最外层 handler 的返回值
+```
+
+如果某个 handler 不调用 `e.Next()` 就直接返回 error，那么其下游所有 handler（包括内嵌 Action）都不会执行，error 直接向上冒泡。
+
+### 3.3 OnRealtimeConnectRequest 钩子的三种报错场景
+
+#### 场景 A：e.Next() 之前返回错误（拒绝建立连接）
+
+```go
+app.OnRealtimeConnectRequest().BindFunc(func(e *core.RealtimeConnectRequestEvent) error {
+    if someCondition {
+        return e.ForbiddenError("connection not allowed", nil)  // ← 未调用 e.Next()
+    }
+    return e.Next()
+})
+```
+
+**执行路径与清理状态**：
+
+| 资源 | 状态 | 原因 |
+|------|------|------|
+| `cancelRequest()` | ✅ 执行 | DEFER-A 在外层作用域，一定执行 |
+| `Broker.Register()` | ❌ 未执行 | 内嵌 Action 未被调用 |
+| `Broker.Unregister()` | ❌ 未注册 | 内嵌 Action 未执行，DEFER-B 不存在 |
+| Client 对象 | ✅ 已创建但未注册 | [realtime.go:71](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L71) 在钩子触发前创建，仅由 GC 回收 |
+| Client.channel | ❌ 未被外部引用 | 未注册到 Broker，无 goroutine 会向其 Send |
+| `maxTimer` / `idleTimer` | ❌ 未创建 | 内嵌 Action 未执行 |
+| 响应状态码 | 403 Forbidden | error 原样向上传播 |
+| activityLogger | ✅ **会记录错误日志** | `err != nil`，不受 SkipSuccessActivityLog 影响 |
+| PB_CONNECT 消息 | ❌ 未发送 | 内嵌 Action 未执行 |
+
+**资源泄漏风险：无**。Client 对象未注册到 Broker，channel 无写入者，最终由 GC 回收。
+
+#### 场景 B：e.Next() 之后返回错误（连接建立后报错）
+
+```go
+app.OnRealtimeConnectRequest().BindFunc(func(e *core.RealtimeConnectRequestEvent) error {
+    err := e.Next()  // ← 调用后内嵌 Action 已完整执行（或因断连退出）
+    if err != nil {
+        return err
+    }
+    // 连接已断开后执行的后置逻辑
+    if somePostCheck {
+        return errors.New("post-connection check failed")  // ← 连接断开后才返回错误
+    }
+    return nil
+})
+```
+
+**执行路径与清理状态**：
+
+| 资源 | 状态 | 原因 |
+|------|------|------|
+| `cancelRequest()` | ✅ 执行 | DEFER-A |
+| `Broker.Register()` | ✅ 已执行 | 内嵌 Action 已调用 |
+| `Broker.Unregister()` | ✅ 已执行 | DEFER-B 在函数返回时触发 |
+| `client.Discard()` | ✅ 已调用 | Unregister 内部调用 |
+| `maxTimer.Stop()` | ✅ 已执行 | DEFER-C |
+| `idleTimer.Stop()` | ✅ 已执行 | DEFER-D |
+| 响应状态码 | 取决于断开前是否已写入 | 若已写入 200 头则无法改变，未写入则按 error 设置 |
+| activityLogger | ✅ **会记录错误日志** | `err != nil` |
+| PB_CONNECT 消息 | 取决于断开时机 | 若断连发生在握手之前则未发送，否则已发送 |
+
+> **重要注意**：`e.Next()` 返回后，连接实际上已经断开（因为内嵌 Action 是阻塞的消息循环）。此时返回 error 仅影响 **日志记录** 和 **未写入的响应状态码**，对连接本身和 Client 清理无影响。开发者可在此做连接级别的后置审计或指标上报。
+
+#### 场景 C：SetWriteDeadline 极早期失败（钩子触发前）
+
+位于 [realtime.go:47-49](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L47-L49)：
+
+```go
+writeDeadlineErr := rc.SetWriteDeadline(time.Time{})
+if writeDeadlineErr != nil {
+    if !errors.Is(writeDeadlineErr, http.ErrNotSupported) {
+        return e.InternalServerError("Failed to initialize SSE connection.", writeDeadlineErr)
+    }
+}
+```
+
+这是唯一 **连 DEFER-A 都不会执行** 的返回路径（因为 `defer cancelRequest()` 注册在第 58 行，在这段检查之后）。不过此时尚未创建任何需要清理的资源（无 context、无 Client、无 Timer、无 Broker 注册），因此无泄漏风险。`http.ErrNotSupported` 会被降级为 Warn 日志而不返回错误。
+
+### 3.4 内嵌 Action 内部不同阶段的失败差异
+
+内嵌 Action 内部所有失败路径最终都 **返回 nil**（而非 error），这是 PocketBase 的设计选择：SSE 长连接的"断开"被视为正常情况而非异常。但不同失败点的清理范围不同：
+
+| 失败点 | 代码位置 | 已注册的 defer | 清理结果 | 对客户端的可见性 |
+|--------|----------|---------------|----------|-----------------|
+| PB_CONNECT 写入/Flush 失败 | [realtime.go:100-106](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L100-L106) | DEFER-A + DEFER-B | Broker.Unregister + cancelRequest | 客户端只看到 TCP 断连，未收到 clientId |
+| 定时器创建后消息循环中断 | 理论上不会失败 | DEFER-A + B + C + D | 全部清理 | 客户端已收到 clientId |
+| 事件消息写入失败 | [realtime.go:145-151](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L145-L151) | DEFER-A + B + C + D | 全部清理 | 客户端已收到之前的消息 |
+| maxTimer / idleTimer 超时 | [realtime.go:120-123](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L120-L123) | DEFER-A + B + C + D | 全部清理 | 正常强制断开 |
+| Context 取消（客户端主动断开） | [realtime.go:156-162](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L156-L162) | DEFER-A + B + C + D | 全部清理 | 客户端主动关闭 |
+| Channel 被外部 Discard 关闭 | [realtime.go:124-131](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L124-L131) | DEFER-A + B + C + D | 全部清理（Broker.Unregister 幂等） | 客户端看到断连 |
+
+### 3.5 OnRealtimeMessageSend 钩子报错的两层差异
+
+`OnRealtimeMessageSend` 在握手和每条事件发送时都会触发。钩子报错的影响取决于发生在 `e.Next()` 的哪一侧：
+
+```go
+connectMsgErr := ce.App.OnRealtimeMessageSend().Trigger(connectMsgEvent,
+    func(me *core.RealtimeMessageEvent) error {
+        err := me.Message.WriteSSE(me.Response, me.Client.Id())  // 实际写入
+        if err != nil { return err }
+        return me.Flush()                                        // 实际推送
+    })
+```
+
+#### 子场景 1：e.Next() 之前返回错误（阻止消息发送）
+
+```go
+app.OnRealtimeMessageSend().BindFunc(func(e *core.RealtimeMessageEvent) error {
+    if !allowed(e.Message.Name) {
+        return errors.New("blocked")  // ← 未调用 e.Next()，WriteSSE 不执行
+    }
+    return e.Next()
+})
+```
+
+- **WriteSSE/Flush**：不执行，消息未写入 Response
+- **外层行为**：`connectMsgErr != nil` → 记录 Debug 日志 → `return nil` → 连接正常断开，defer 链正常执行
+- **影响**：客户端收不到该条消息，连接被关闭（握手场景）或当前消息被跳过并关闭连接（事件场景）
+
+#### 子场景 2：e.Next() 之后返回错误（消息已发送后报错）
+
+```go
+app.OnRealtimeMessageSend().BindFunc(func(e *core.RealtimeMessageEvent) error {
+    err := e.Next()  // ← WriteSSE + Flush 已完成，字节已推送到客户端
+    auditLog(e.Message)  // 后置审计
+    return errors.New("post-check failed")
+})
+```
+
+- **WriteSSE/Flush**：已执行，消息已到达客户端 TCP 缓冲区
+- **外层行为**：`msgErr != nil` → 记录 Debug 日志 → `return nil` → 连接关闭
+- **影响**：客户端实际上收到了消息，但服务端认为"发送失败"并关闭连接。这是 **最终一致性不一致窗口**：客户端可能基于已收到的消息做了操作，但服务端已断开连接。开发者应谨慎在此位置返回 error，若只需审计应返回 nil。
+
+### 3.6 订阅请求钩子的清理边界对比
+
+订阅请求 `OnRealtimeSubscribeRequest` 的资源模型与连接请求不同：所有订阅修改都在 **内存中** 操作（Client 的订阅 map 和认证状态 store），无外部资源需要 defer 释放。
+
+#### 订阅场景 A：e.Next() 之前返回错误
+
+```go
+app.OnRealtimeSubscribeRequest().BindFunc(func(e *core.RealtimeSubscribeRequestEvent) error {
+    if !validate(e.Subscriptions) {
+        return e.BadRequestError("invalid subscription", nil)  // ← 未调用 e.Next()
+    }
+    return e.Next()
+})
+```
+
+| 操作 | 是否执行 |
+|------|----------|
+| `client.Set(auth)` | ❌ 不执行，认证状态不更新 |
+| `client.Unsubscribe()` | ❌ 不执行，旧订阅保留 |
+| `client.Subscribe(subs)` | ❌ 不执行，新订阅不写入 |
+| HTTP 响应 | 400 Bad Request |
+| activityLogger | ✅ 记录错误日志 |
+
+#### 订阅场景 B：e.Next() 之后返回错误
+
+```go
+app.OnRealtimeSubscribeRequest().BindFunc(func(e *core.RealtimeSubscribeRequestEvent) error {
+    err := e.Next()  // ← 认证状态已更新、订阅已整体替换
+    if someExternalCheck {
+        return errors.New("external check failed")
+    }
+    return err
+})
+```
+
+| 操作 | 是否执行 |
+|------|----------|
+| `client.Set(auth)` | ✅ 已执行 |
+| `client.Unsubscribe()` | ✅ 已执行，旧订阅已清空 |
+| `client.Subscribe(subs)` | ✅ 已执行，新订阅已写入 |
+| HTTP 响应 | 取决于 `execAfterSuccessTx`：非事务模式下 error 直接返回 500；事务模式下 OnComplete 中才会写响应 |
+| activityLogger | ✅ 记录错误日志 |
+
+> **关键风险**：订阅修改是 **非事务性的内存操作**。即使外层处于数据库事务中，`client.Subscribe()` 的结果也不会随事务回滚而撤销。若在 `e.Next()` 之后返回 error，客户端会收到 500 错误认为订阅失败，但服务端内存中订阅 **实际上已经生效**，后续事件仍会推送到该客户端。开发者应避免在此位置返回会误导客户端的 error。
+
+---
+
+## 四、握手写入失败与事件写入失败的退出清理
+
+### 4.1 核心清理机制概览
 
 SSE 连接的所有退出路径最终都会走到同一个 **defer 清理链**，该链在 [realtimeConnect](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L57-L81) 中建立：
 
@@ -246,7 +495,7 @@ func (b *Broker) Unregister(clientId string) {
 }
 ```
 
-### 3.2 握手（PB_CONNECT）写入失败的清理流程
+### 4.2 握手（PB_CONNECT）写入失败的清理流程
 
 握手消息写入位于 [realtime.go:86-107](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L86-L107)，包含两步操作：
 1. `Message.WriteSSE(me.Response, me.Client.Id())` — 将 SSE 格式的字节写入 Response buffer
@@ -280,7 +529,7 @@ OnRealtimeConnectRequest 的 Trigger 结束，内嵌 handler 返回
 - 握手失败时 `return nil` 而非 error，是有意为之：SSE 长连接的"断开"不应视为异常，避免污染错误日志
 - `IsDiscarded()` 检查会阻止后续所有 `client.Send()` 调用（此时定时器尚未创建，尚无 pending 消息）
 
-### 3.3 事件消息写入失败的清理流程
+### 4.3 事件消息写入失败的清理流程
 
 消息循环中的事件写入位于 [realtime.go:134-152](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L134-L152)，结构与握手完全一致，但处于 for-select 循环内。
 
@@ -315,7 +564,7 @@ return nil → 退出 for-select 循环，退出内嵌 handler
 - 多了两个定时器 defer（`idleTimer.Stop()` 和 `maxTimer.Stop()`），释放定时器资源避免内存泄漏
 - 此时 `client.channel` 中可能还有未读消息，但 `Discard()` 关闭 channel 后，任何试图 `Send()` 的 goroutine 都会被 `recover()` 捕获（见 [client.go:274-285](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/tools/subscriptions/client.go#L274-L285)）
 
-### 3.4 其他退出路径的清理对比
+### 4.4 其他退出路径的清理对比
 
 | 退出原因 | 触发位置 | return 值 | 清理行为 |
 |----------|----------|-----------|----------|
@@ -327,7 +576,7 @@ return nil → 退出 for-select 循环，退出内嵌 handler
 | 客户端主动断开 | [realtime.go:156-163](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L156-L163) | `nil` | 日志标记 "cancelled request"，defer 链执行 |
 | OnRealtimeConnectRequest 钩子返回 error | 用户自定义 Handler | 非 nil error | defer 链仍执行，但 activityLogger 会记录错误日志 |
 
-### 3.5 `DefaultClient.Send()` 的发送容错
+### 4.5 `DefaultClient.Send()` 的发送容错
 
 位于 [client.go:274-285](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/tools/subscriptions/client.go#L274-L285)：
 
@@ -347,11 +596,11 @@ func (c *DefaultClient) Send(m Message) {
 
 ---
 
-## 四、事件过滤机制
+## 五、事件过滤机制
 
 事件广播触发点在 [bindRealtimeEvents](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L330-L527) 中绑定的多个数据模型 Hook 上，核心分发函数是 [realtimeBroadcastRecord](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L594-L773)。
 
-### 4.1 事件触发源
+### 5.1 事件触发源
 
 | Hook | 动作 | 说明 |
 |------|------|------|
@@ -359,7 +608,7 @@ func (c *DefaultClient) Send(m Message) {
 | `OnModelAfterUpdateSuccess` | update | 记录更新成功后广播 |
 | `OnModelDelete` + `OnModelAfterDeleteSuccess` | delete | 采用「预缓存 + 事务后广播」两段式，避免事务回滚造成误通知 |
 
-### 4.2 订阅主题匹配
+### 5.2 订阅主题匹配
 
 广播时构建 6 种可能的订阅前缀进行匹配：
 
@@ -384,7 +633,7 @@ if strings.HasPrefix(s+"?", prefix) {
 
 给每个订阅主题末尾追加 `?` 再匹配前缀，确保 `posts/abc` 不会错误匹配 `posts/abcd`。
 
-### 4.3 两层权限过滤
+### 5.3 两层权限过滤
 
 **第一层：API 规则过滤（服务端强制）**
 
@@ -411,7 +660,7 @@ if filter != "" {
 
 这意味着即使事件已广播，若记录不满足客户端指定的 filter 表达式，该客户端也不会收到通知。
 
-### 4.4 数据裁剪与增强
+### 5.4 数据裁剪与增强
 
 通过权限检查后，消息数据还会经过以下处理：
 
@@ -434,9 +683,9 @@ if filter != "" {
 
 ---
 
-## 五、连接断开后的处理
+## 六、连接断开后的处理
 
-### 5.1 正常断开的清理路径
+### 6.1 正常断开的清理路径
 
 连接断开会触发以下清理链条：
 
@@ -458,11 +707,11 @@ defer 链逆序执行（LIFO）：
 
 [DefaultClient.Discard](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/tools/subscriptions/client.go#L252-L263) 是幂等的，多次调用不会 panic。关闭 channel 后，主循环中的 `case msg, ok := <-ce.Client.Channel()` 会收到 `ok=false`，也会退出函数，形成 **双重保障**。
 
-### 5.2 消息发送时的容错
+### 6.2 消息发送时的容错
 
-参见上文 3.5 节。
+参见上文 4.5 节。
 
-### 5.3 认证状态联动清理
+### 6.3 认证状态联动清理
 
 当用户相关数据发生变化时，系统会主动清理所有关联客户端的认证缓存，防止权限提升后旧连接滥用。相关函数位于 [realtime.go:251-L328](file:///d:/fz/0601/solo-dogfeeding/code/158-pocketbase/apis/realtime.go#L251-L328)：
 
@@ -477,7 +726,7 @@ defer 链逆序执行（LIFO）：
 
 **注意**：清理后客户端不会立即断开，而是保持未认证状态；下次发送 `POST /api/realtime` 时可重新认证。
 
-### 5.4 Delete 事件的事务安全
+### 6.4 Delete 事件的事务安全
 
 Delete 操作采用三段式处理以避免事务回滚造成的误通知：
 
@@ -497,7 +746,7 @@ Delete 操作采用三段式处理以避免事务回滚造成的误通知：
 
 ---
 
-## 六、完整数据流时序图
+## 七、完整数据流时序图
 
 ```
   客户端                          中间件层                          应用钩子层                          Handler 内核
@@ -562,7 +811,7 @@ Delete 操作采用三段式处理以避免事务回滚造成的误通知：
 
 ---
 
-## 七、关键常量与配置
+## 八、关键常量与配置
 
 | 常量 | 值 | 含义 | 位置 |
 |------|----|------|------|
