@@ -289,6 +289,102 @@ RouterGroup 和 Route 都支持 `Unbind(middlewareIds...)`，解绑时会：
 subGroup := rg.Group("/collections/{collection}/records").Unbind(DefaultRateLimitMiddlewareId)
 ```
 
+### 3.6 两套限流机制：collectionPathRateLimit vs checkCollectionRateLimit
+
+PocketBase 有两种限流使用方式，分别对应不同场景：
+
+| 维度 | collectionPathRateLimit | checkCollectionRateLimit |
+|------|-------------------------|-------------------------|
+| **类型** | 中间件（`*hook.Handler`），可通过 `.Bind()` 绑定到路由 | 普通函数，直接在 handler 内部调用 |
+| **所在文件** | [apis/middlewares_rate_limit.go:54-75](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_rate_limit.go#L54-L75) | [apis/middlewares_rate_limit.go:81-108](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_rate_limit.go#L81-L108) |
+| **collection 参数来源** | 从 URL path 中通过 `e.Request.PathValue(collectionPathParam)` 动态解析 | 由调用方作为参数直接传入已解析的 `*core.Collection` |
+| **返回值** | 返回 `e.Next()` 或 NotFoundError（解析 collection 失败） | 返回 `error`（nil 或 429 TooManyRequestsError） |
+| **是否调用 e.Next()** | 是（作为中间件必须调用） | 否（纯函数检查） |
+| **使用场景** | 认证类路由（不会被 Batch 复用） | CRUD 路由（会被 Batch API 复用） |
+
+**调用关系：collectionPathRateLimit 内部调用 checkCollectionRateLimit**
+
+```go
+// collectionPathRateLimit（中间件）
+func collectionPathRateLimit(collectionPathParam string, baseTags ...string) *hook.Handler[*core.RequestEvent] {
+    return &hook.Handler[*core.RequestEvent]{
+        Id:       DefaultRateLimitMiddlewareId,
+        Priority: DefaultRateLimitMiddlewarePriority,
+        Func: func(e *core.RequestEvent) error {
+            // 第1步：从 path 解析 collection
+            collection, err := e.App.FindCachedCollectionByNameOrId(
+                e.Request.PathValue(collectionPathParam),
+            )
+            if err != nil {
+                return e.NotFoundError("Missing or invalid collection context.", err)
+            }
+
+            // 第2步：委托给 checkCollectionRateLimit 执行真正的限流检查
+            if err := checkCollectionRateLimit(e, collection, baseTags...); err != nil {
+                return err
+            }
+
+            return e.Next()  // 第3步：中间件必须调用 Next
+        },
+    }
+}
+```
+
+**为什么 CRUD 路由不使用中间件形式？**
+
+[apis/record_crud.go:26-27](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/record_crud.go#L26-L27) 注释说明：
+> "the rate limiter is inlined because some of the crud actions are also used in the batch APIs"
+
+因为 CRUD handler 会被 [Batch API](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/batch.go#L37-L71) 直接复用（如 `recordCreate(false, next)`、`recordUpdate(false, next)`），如果限流是路由中间件：
+- 直接 HTTP 请求：中间件会执行，正常限流 ✓
+- Batch 内部调用：不经过 HTTP 路由和中间件链，无法限流 ✗
+
+所以 CRUD 必须采用 **handler 内联调用** 的方式，确保无论直接请求还是 Batch 复用都能触发限流。
+
+### 3.7 CRUD 路由中间件链的实际绑定代码
+
+[apis/record_crud.go:25-34](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/record_crud.go#L25-L34)：
+
+```go
+func bindRecordCrudApi(app core.App, rg *router.RouterGroup[*core.RequestEvent]) {
+    // 第1步：创建子分组，解绑全局限速中间件（因为要改成内联调用）
+    subGroup := rg.Group("/collections/{collection}/records").
+        Unbind(DefaultRateLimitMiddlewareId)
+
+    // 第2步：注册路由（每条路由可独立绑定自己的中间件）
+    subGroup.GET("", recordsList)                                              // GET /api/collections/{collection}/records
+    subGroup.GET("/{id}", recordView)                                          // GET /api/collections/{collection}/records/{id}
+    subGroup.POST("", recordCreate(true, nil)).Bind(dynamicCollectionBodyLimit(""))   // POST + 集合级 body limit
+    subGroup.PATCH("/{id}", recordUpdate(true, nil)).Bind(dynamicCollectionBodyLimit("")) // PATCH + 集合级 body limit
+    subGroup.DELETE("/{id}", recordDelete(true, nil))                          // DELETE
+}
+```
+
+对比认证类路由的绑定方式（[apis/record_auth.go:22-66](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/record_auth.go#L22-L66)）：
+
+```go
+// 认证路由使用中间件形式的限流（因为不会被 Batch 复用）
+sub.POST("/auth-with-password", recordAuthWithPassword).Bind(
+    collectionPathRateLimit("", "authWithPassword", "auth"),  // 中间件限流
+)
+```
+
+**CRUD POST 创建路由的完整中间件链（从外到内）**：
+
+| 层级 | 来源 | Priority | 中间件/处理 |
+|------|------|----------|------------|
+| 全局 | pbRouter.Bind() | -99999 | wwwRedirect |
+| 全局 | pbRouter.Bind() | -1041 | CORS |
+| 全局 | pbRouter.Bind() | -1040 | activityLogger |
+| 全局 | pbRouter.Bind() | -1030 | panicRecover |
+| 全局 | pbRouter.Bind() | -1020 | loadAuthToken |
+| 全局 | pbRouter.Bind() | -1015 | superuserIPsWhitelist |
+| 全局 | pbRouter.Bind() | -1010 | securityHeaders |
+| ~~全局~~ | ~~pbRouter.Bind()~~ | ~~-1000~~ | ~~rateLimit~~ **（被 Unbind 解绑）** |
+| 全局 | pbRouter.Bind() | -990 | BodyLimit（默认 32MB） |
+| 路由级 | subGroup.POST(...).Bind(...) | -990 | dynamicCollectionBodyLimit（按文件字段累加） |
+| — | — | — | **recordCreate Action**（handler 内联 checkCollectionRateLimit） |
+
 ---
 
 ## 4. 鉴权流程
@@ -641,9 +737,213 @@ func firstApiError(errs ...error) *router.ApiError {
 
 ---
 
-## 7. 完整请求流程示例
+## 7. CRUD 请求在中间件、处理器、错误处理器间的实际处理过程
 
-以 `POST /api/collections/users/records` 创建记录为例。注意 `/collections/{collection}/records` 分组通过 `Unbind(DefaultRateLimitMiddlewareId)` 解绑了全局限速，改在每个路由上用 `collectionPathRateLimit` 做集合级限速。
+以 `POST /api/collections/users/records` 创建记录请求为例，完整走读每个阶段：
+
+### 7.1 阶段一：HTTP 路由层（BuildMux 注册的 handler）
+
+[tools/router/router.go:130-151](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/router/router.go#L130-L151)
+
+```
+HTTP 请求到达
+   │
+   ├─ 包装 ResponseWriter → ResponseWriter{written:false, status:0}
+   ├─ 包装 Request.Body → RereadableReadCloser（支持重复读取）
+   ├─ EventFactory 创建 RequestEvent{App, Response, Request, Auth:nil}
+   │
+   ├─ 构建 routeHook：
+   │   ├─ 父分组中间件（按 Priority 排序，排除已 Unbind 的）
+   │   ├─ 当前路由中间件（dynamicCollectionBodyLimit）
+   │   └─ Action = recordCreate(true, nil)
+   │
+   ├─ err := routeHook.Trigger(event, v.Action)  ← 进入中间件链
+   │
+   └─ if err != nil { ErrorHandler(resp, req, err) }  ← 错误处理入口
+```
+
+### 7.2 阶段二：全局中间件链（Hook 洋葱 Before 阶段，从外到内）
+
+```
+wwwRedirect (-99999)
+  ├─ 检查是否需要 www 前缀重定向
+  └─ e.Next()
+     │
+CORS (-1041)
+  ├─ 处理 OPTIONS 预检请求（若是直接写响应 return nil）
+  ├─ 设置 Access-Control-* 响应头
+  └─ e.Next()
+     │
+activityLogger (-1040)
+  ├─ e.Set(__execStart, time.Now())  ← 记录起始时间
+  └─ err := e.Next()
+     │     └─ 后续所有中间件+Action 都在此函数内执行
+     │
+panicRecover (-1030)
+  ├─ defer func() { if r := recover(); ... { err = 500 ApiError } }()
+  └─ e.Next()
+     │
+loadAuthToken (-1020)
+  ├─ 从 Authorization 头提取 Token
+  ├─ 调用 app.FindAuthRecordByToken() 解析
+  ├─ 成功则 e.Auth = record，失败不报错（Auth 保持 nil）
+  └─ e.Next()
+     │
+superuserIPsWhitelist (-1015)
+  ├─ 若 e.Auth != nil 且是超管集合，检查 e.RealIP() 是否在 Settings.SuperuserIPs 白名单
+  ├─ 不在白名单 → return e.ForbiddenError(...)
+  └─ e.Next()
+     │
+securityHeaders (-1010)
+  ├─ 写 X-Content-Type-Options、X-XSS-Protection、X-Frame-Options
+  └─ e.Next()
+     │
+【全局 rateLimit (-1000) 已被 Unbind，跳过】
+     │
+BodyLimit (-990)
+  ├─ 检查 Content-Length > DefaultMaxBodySize(32MB)
+  ├─ 超限 → return ErrRequestEntityTooLarge (413)
+  ├─ 包装 e.Request.Body = limitedReader（流式读取时也会检查）
+  └─ e.Next()
+     │
+```
+
+### 7.3 阶段三：路由级中间件 + 处理器（recordCreate Action）
+
+```
+dynamicCollectionBodyLimit (-990)  ← 路由级 .Bind()
+  ├─ 从 path 解析 collection
+  ├─ 遍历 collection.Fields，累加 File 等字段的 MaxBodySize
+  ├─ 再次 applyBodyLimit（可能比 32MB 更大）
+  └─ e.Next()
+     │
+recordCreate Action (handler)  ← [apis/record_crud.go:209-390]
+  │
+  ├─ Step 1: 解析 collection
+  │     e.App.FindCachedCollectionByNameOrId(pathValue("collection"))
+  │     失败 → return e.NotFoundError(...)
+  │     是 View 集合 → return e.BadRequestError(...)
+  │
+  ├─ Step 2: 限流检查（内联函数，不是中间件！）
+  │     err = checkCollectionRateLimit(e, collection, "create")
+  │     超限 → return e.TooManyRequestsError(...)  ← 429 直接冒泡
+  │
+  ├─ Step 3: 解析 RequestInfo（Query/Headers/Body/Auth/Method/Context）
+  │     requestInfo, err := e.RequestInfo()
+  │     err → return firstApiError(err, e.BadRequestError("", err))
+  │
+  ├─ Step 4: API 规则级鉴权
+  │     !hasSuperuserAuth && collection.CreateRule == nil
+  │       → return e.ForbiddenError("Only superusers...")
+  │
+  ├─ Step 5: 构造 Record 和 Form，加载数据
+  │     record := core.NewRecord(collection)
+  │     data, err := recordDataFromRequest(e, record)
+  │     form := forms.NewRecordUpsert(app, record)
+  │     form.Load(data)
+  │
+  ├─ Step 6: 验证 CreateRule（非超管且规则非空）
+  │     构造 dummyRecord + WITH 子查询，将规则解析为 SQL WHERE
+  │     查询不存在 → return e.BadRequestError("create rule failure")
+  │
+  ├─ Step 7: 触发 OnRecordCreateRequest Hook 链（用户可扩展）
+  │     event := new(core.RecordRequestEvent)
+  │     event.RequestEvent = e
+  │     hookErr := app.OnRecordCreateRequest().Trigger(event, func(e *core.RecordRequestEvent) error {
+  │         // Hook 的最内层 Action
+  │         ├─ form.Submit()  ← 数据库事务内保存记录
+  │         │     失败 → return firstApiError(err, e.BadRequestError(...))
+  │         ├─ EnrichRecord()  ← 计算 expand 等
+  │         ├─ execAfterSuccessTx(responseWriteAfterTx, ...)
+  │         │     └─ e.JSON(200, record)  ← 写响应，written=true
+  │         └─ optFinalizer（Batch API 场景使用）
+  │     })
+  │     hookErr != nil → return hookErr  ← Hook 链中产生的错误冒泡
+  │
+  └─ Step 8: return nil  ← 正常结束
+```
+
+### 7.4 阶段四：Hook 洋葱 After 阶段（错误冒泡，从内到外）
+
+假设 Step 2 触发了限流，返回了 429 `*ApiError`：
+
+```
+recordCreate Action
+  └─ return TooManyRequestsError (429 *ApiError)
+        │
+dynamicCollectionBodyLimit.After
+  └─ err := e.Next() → return err  ← 原样透传
+        │
+BodyLimit.After
+  └─ err := e.Next() → return err  ← 原样透传
+        │
+securityHeaders.After
+  └─ err := e.Next() → return err  ← 原样透传
+        │
+superuserIPsWhitelist.After
+  └─ err := e.Next() → return err  ← 原样透传
+        │
+loadAuthToken.After
+  └─ err := e.Next() → return err  ← 原样透传
+        │
+panicRecover.After
+  └─ err := e.Next() → return err  ← 非 panic，原样透传
+        │
+activityLogger.After
+  ├─ err := e.Next()  ← 收到 429 ApiError
+  ├─ logRequest(e, err)
+  │     ├─ status = 429（从 ApiError.Status 读取，因为 resp.Written 还是 false）
+  │     ├─ attrs = [..., "error", message, "details", rawData]
+  │     └─ app.Logger().Error("POST /api/collections/...", attrs...)
+  └─ return err  ← 不吞错误，继续向上冒泡
+        │
+CORS.After
+  └─ err := e.Next() → return err  ← 原样透传
+        │
+wwwRedirect.After
+  └─ err := e.Next() → return err  ← 原样透传
+        │
+Hook.Trigger()
+  └─ return err  ← Hook 链最终返回 429 ApiError
+```
+
+### 7.5 阶段五：ErrorHandler 写回响应
+
+[tools/router/router.go:160-183](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/router/router.go#L160-L183)
+
+```
+BuildMux handler 收到 err
+   │
+   └─ ErrorHandler(resp, req, err):
+        │
+        ├─ 1. err != nil ✓
+        ├─ 2. resp.Written() = false  ✓（handler 没写过响应）
+        ├─ 3. Content-Type 为空 → 设置 "application/json"
+        ├─ 4. apiErr := ToApiError(err)  → 已是 *ApiError，直接返回
+        ├─ 5. resp.WriteHeader(429)  → 标记 written=true, status=429
+        └─ 6. json.Encode({
+                "status": 429,
+                "message": "",
+                "data": {}
+             })
+```
+
+### 7.6 正常成功路径与错误路径的分支对比
+
+| 节点 | 成功路径（CreateRule 通过） | 错误路径（限流触发） |
+|------|---------------------------|---------------------|
+| recordCreate Step 2 checkCollectionRateLimit | return nil，继续 | return 429 ApiError，**直接退出** |
+| 后续 Step 3-8 | 全部执行，最终 e.JSON(200, record) | **不执行** |
+| resp.Written() | true（Step 7 e.JSON 写入） | false（handler 未写响应） |
+| activityLogger 日志级别 | Info | Error |
+| ErrorHandler 执行 | **跳过**（Written=true） | 执行，写 429 JSON |
+| HTTP 响应状态码 | 200（e.JSON 设置） | 429（ErrorHandler 设置） |
+
+---
+
+## 8. 完整请求流程示例
+
+以 `POST /api/collections/users/records` 创建记录为例。注意 `/collections/{collection}/records` 分组通过 `Unbind(DefaultRateLimitMiddlewareId)` 解绑了全局 `rateLimit` 中间件，改在每个 handler **内部内联调用 `checkCollectionRateLimit`**（因为 CRUD handler 会被 Batch API 复用，无法走中间件链）。
 
 ```
 1. http.Server 接收请求，交给 ServeMux
@@ -660,11 +960,12 @@ func firstApiError(errs ...error) *router.ApiError {
    │   │   │   │   ┌─ loadAuthToken (-1020): 解析 Authorization 头 → e.Auth → e.Next()
    │   │   │   │   │   ┌─ superuserIPsWhitelist (-1015): 若 e.Auth 是超管则检查 IP → e.Next()
    │   │   │   │   │   │   ┌─ securityHeaders (-1010): 写 X-XSS-Protection 等头 → e.Next()
-   │   │   │   │   │   │   │   ┌─ BodyLimit (-990): 检查 Content-Length，包装 limitedReader → e.Next()
-   │   │   │   │   │   │   │   │   ┌─ collectionPathRateLimit (-1000): 集合级速率检查 → e.Next()
+   │   │   │   │   │   │   │   ┌─ 【全局 rateLimit(-1000) 已被 Unbind，跳过】
+   │   │   │   │   │   │   │   │   ┌─ BodyLimit (-990): 检查 Content-Length，包装 limitedReader → e.Next()
    │   │   │   │   │   │   │   │   │   ┌─ dynamicCollectionBodyLimit (-990): 集合字段累加 body 上限 → e.Next()
    │   │   │   │   │   │   │   │   │   │   └─ recordCreate Action (路由 handler)
    │   │   │   │   │   │   │   │   │   │       ├─ 查找 collection
+   │   │   │   │   │   │   │   │   │   │       ├─ ✅ 内联 checkCollectionRateLimit (限流在此，非中间件)
    │   │   │   │   │   │   │   │   │   │       ├─ 解析 RequestInfo
    │   │   │   │   │   │   │   │   │   │       ├─ 检查 CreateRule 权限（API 规则级鉴权）
    │   │   │   │   │   │   │   │   │   │       ├─ 创建 RecordRequestEvent
@@ -673,15 +974,14 @@ func firstApiError(errs ...error) *router.ApiError {
    │   │   │   │   │   │   │   │   │   │       ├─ 成功: e.JSON(200, record) 写响应 → Written=true
    │   │   │   │   │   │   │   │   │   │       └─ 失败: return firstApiError(err, e.BadRequestError(...))
    │   │   │   │   │   │   │   │   │   └─ dynamicCollectionBodyLimit After: return err（原样透传）
-   │   │   │   │   │   │   │   │   └─ collectionPathRateLimit After: return err（原样透传）
-   │   │   │   │   │   │   │   └─ BodyLimit After: return err（原样透传）
-   │   │   │   │   │   │   └─ securityHeaders After: return err（原样透传）
-   │   │   │   │   │   └─ superuserIPsWhitelist After: return err（原样透传）
-   │   │   │   │   └─ loadAuthToken After: return err（原样透传）
-   │   │   │   └─ panicRecover After: 若捕获 panic → 转为 500 ApiError；否则 return err
-   │   │   └─ activityLogger After: logRequest(e, err) 写访问日志 → return err
-   │   └─ CORS After: return err（原样透传）
-   └─ wwwRedirect After: return err（原样透传）
+   │   │   │   │   │   │   │   │   └─ BodyLimit After: return err（原样透传）
+   │   │   │   │   │   │   │   └─ securityHeaders After: return err（原样透传）
+   │   │   │   │   │   │   └─ superuserIPsWhitelist After: return err（原样透传）
+   │   │   │   │   │   └─ loadAuthToken After: return err（原样透传）
+   │   │   │   │   └─ panicRecover After: 若捕获 panic → 转为 500 ApiError；否则 return err
+   │   │   │   └─ activityLogger After: logRequest(e, err) 写访问日志 → return err
+   │   │   └─ CORS After: return err（原样透传）
+   │   └─ wwwRedirect After: return err（原样透传）
 
 7. Hook.Trigger() 返回最终 err
 8. BuildMux handler 判断：
@@ -722,7 +1022,7 @@ recordCreate Action
 
 ---
 
-## 8. 关键文件索引
+## 9. 关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -735,11 +1035,16 @@ recordCreate Action
 | [tools/hook/event.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/hook/event.go) | Resolver 接口、Next 机制 |
 | [apis/serve.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/serve.go) | 服务器启动、BuildMux 调用时机 |
 | [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/base.go) | NewRouter 初始化、EventFactory、全局中间件注册 |
-| [apis/middlewares.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go) | 所有内置中间件（鉴权、日志、panic、安全头等） |
+| [apis/middlewares.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go) | 内置中间件（鉴权、日志、panic、安全头、www 重定向等） |
+| [apis/middlewares_rate_limit.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_rate_limit.go) | rateLimit / collectionPathRateLimit / checkCollectionRateLimit 三套限流 |
+| [apis/middlewares_body_limit.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_body_limit.go) | BodyLimit / dynamicCollectionBodyLimit 请求体大小限制 |
+| [apis/middlewares_cors.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_cors.go) | CORS 跨域中间件 |
+| [apis/record_crud.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/record_crud.go) | bindRecordCrudApi 路由绑定、recordsList/recordView/recordCreate/recordUpdate/recordDelete handler |
+| [apis/record_auth.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/record_auth.go) | bindRecordAuthApi 路由绑定、认证类 handler、使用 collectionPathRateLimit 中间件限流 |
+| [apis/record_helpers.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/record_helpers.go) | firstApiError 等辅助函数 |
+| [apis/batch.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/batch.go) | Batch API，直接复用 CRUD handler（因此 CRUD 限流必须内联而非中间件） |
 | [core/event_request.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/core/event_request.go) | RequestEvent、RequestInfo |
-| [core/events.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/core/events.go) | 所有应用级事件类型 |
+| [core/events.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/core/events.go) | 所有应用级事件类型（RecordRequestEvent 等） |
 | [core/record_query.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/core/record_query.go) | FindAuthRecordByToken Token 验证 |
 | [core/record_tokens.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/core/record_tokens.go) | Token 生成 |
 | [tools/security/jwt.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/security/jwt.go) | JWT 解析与生成 |
-| [apis/record_crud.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/record_crud.go) | 记录 CRUD handler、API 规则应用 |
-| [apis/record_helpers.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/record_helpers.go) | firstApiError 等辅助函数 |
