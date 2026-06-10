@@ -19,13 +19,16 @@
 
 ```go
 type Handler[T Resolver] struct {
-    Func     func(T) error   // 实际执行的处理函数，必须调用 e.Next() 推进链
+    Func     func(T) error   // 实际执行的处理函数，通常需要调用 e.Next() 推进链条
     Id       string          // 唯一标识，用于后续移除或替换
     Priority int             // 优先级，数值越小越先执行
 }
 ```
 
-**关键约束**：`Func` 内部必须调用 `e.Next()`，否则钩子链会在此处终止。
+**关键说明**：
+- `Func` 内部如果想要后续 Handler 继续执行，需要显式调用 `e.Next()`
+- 如果不调用 `e.Next()` 就 return（无论返回 nil 还是 error），前进方向的链条在此处终止
+- 故意不调用 `e.Next()` 是合法行为（例如中间件拦截未授权的请求）
 
 ---
 
@@ -148,9 +151,10 @@ return event.Next()
 ```
 
 **结论**：
-- **e.Next() 之前**的代码按 Priority 升序执行（先注册/优先级高的先执行）
-- **e.Next() 之后**的代码按 Priority 降序执行（先注册/优先级高的后执行）
-- 某个 Handler 若不调用 `e.Next()`，链条在此终止，后续 Handler 不会执行
+- **e.Next() 之前**的代码（前进方向）按 Priority 升序执行（先注册/优先级高的先执行）
+- **e.Next() 之后**的代码（返回方向）按 Priority 降序执行（先注册/优先级高的后执行）
+- 某个 Handler 若不调用 `e.Next()` 就 return → **前进方向终止**，后续更内层的 Handler 不会被执行，但当前 Handler 及外层 Handler 的后半部分代码仍会沿返回方向继续执行
+- 详细错误行为参见第五章"错误传播机制"
 
 ### 3.4 oneOff 处理函数的作用
 
@@ -220,60 +224,190 @@ func (h *TaggedHook[T]) Bind(handler *Handler[T]) string {
 
 ---
 
-## 五、错误传播机制
+## 五、错误传播机制（修正版）
 
-### 5.1 错误如何中断链条
+之前的说法"返回 error 立即终止链条"是不准确的。错误行为取决于 **error 是在 e.Next() 之前还是之后返回**，这和洋葱模型的双路径密切相关。
 
-钩子链中任何 Handler 返回非 nil error，整个链条 **立即终止**，该 error 逐层向上冒泡。
+### 5.1 先理解：链条的两个方向
+
+钩子链是 **洋葱模型**，存在两条路径：
+
+```
+前进方向（Next 之前）:  Handler A → Handler B → Handler C → oneOff
+返回方向（Next 之后）:  Handler A ← Handler B ← Handler C ← oneOff
+```
+
+- **前进方向**：由 `e.Next()` 的调用驱动，从外到内
+- **返回方向**：由函数 return 驱动，从内到外
+
+**只有前进方向可以被"中断"**——只要某个 Handler 不调用 `e.Next()`，后续（更内层的）Handler 就不会被执行。而返回方向上的 Handler 已经在调用栈上了，它们的后半部分代码一定会执行（除非 panic）。
+
+### 5.2 场景对比：Next 前返回 vs Next 后返回
+
+假设有 3 个 Handler 按优先级排序为 `[A, B, C]`，我们分别在 B 的不同位置返回错误，看行为差异。
+
+#### 场景 A：在 Next() 之前返回错误（前进方向中断）
 
 ```go
-// Event.Next() 的实现
-func (e *Event) Next() error {
-    if e.next != nil {
-        return e.next()  // 若 next 返回 error，直接返回
+// Handler B
+Func: func(e *Event) error {
+    return errors.New("fail")  // 不调用 e.Next()，直接返回
+}
+```
+
+执行路径：
+
+```
+A 前半 → e.Next()
+  └─> B 直接返回 error（从未调用 e.Next()）
+        └─> ❌ C 根本不会被执行
+              ❌ oneOff 根本不会被执行
+A 后半（return e.Next() → 收到 error）
+```
+
+**结论**：前进方向被阻断，B 之后的所有 Handler（C、oneOff）都不会执行。错误直接成为 `e.Next()` 的返回值向上冒泡。
+
+#### 场景 B：在 Next() 之后返回错误（仅返回方向冒泡）
+
+```go
+// Handler B
+Func: func(e *Event) error {
+    e.Next()                    // 先调用 Next 推进链条
+    return errors.New("fail")   // 然后返回错误
+}
+```
+
+执行路径：
+
+```
+A 前半 → e.Next()
+  └─> B 前半 → e.Next()
+        └─> C 前半 → e.Next()
+              └─> oneOff 执行完毕 ← return nil
+        C 后半 ← return nil
+  B 后半 ← return errors.New("fail")   // C 执行完了，B 才返回 error
+A 后半 ← e.Next() 收到 error，向上冒泡
+```
+
+**结论**：
+- **前进方向不受影响**：C 和 oneOff 都完整执行了（因为 B 在返回 error 之前已经调用了 `e.Next()`）
+- **错误沿返回方向冒泡**：A 可以通过 `e.Next()` 的返回值捕获到这个 error
+- 测试证据：[hook_test.go#L32](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/hook_test.go#L32) 的注释明确写着 `// error shouldn't stop the chain`，测试中 handler7 在 Next 后返回 error，但 handler8、handler9 仍然被执行。
+
+### 5.3 Handler 对错误的三种处理方式
+
+外层 Handler 可以通过 `e.Next()` 的返回值拿到内层错误，有三种处理策略：
+
+```go
+// 策略 1：直接透传（最常见）
+Func: func(e *Event) error {
+    // 前半逻辑
+    return e.Next()  // 内层的 error 直接向上传
+}
+
+// 策略 2：捕获并处理错误
+Func: func(e *Event) error {
+    // 前半逻辑
+    err := e.Next()
+    if err != nil {
+        log.Println("捕获到错误:", err)
+        return nil    // 吞掉错误，外层不会知道
+    }
+    // 后半逻辑
+    return nil
+}
+
+// 策略 3：包装错误后继续冒泡
+Func: func(e *Event) error {
+    // 前半逻辑
+    err := e.Next()
+    if err != nil {
+        return fmt.Errorf("handler A 包裹: %w", err)
     }
     return nil
 }
 ```
 
-### 5.2 Model CRUD 的错误钩子
+### 5.4 Event.Next() 的源码验证
+
+参见 [event.go#L30-L35](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/event.go#L30-L35)：
+
+```go
+func (e *Event) Next() error {
+    if e.next != nil {
+        return e.next()  // 把内层 handler 的返回值直接交给外层
+    }
+    return nil
+}
+```
+
+`Next()` 只是简单地把内层闭包的返回值透传出来。内层返回什么，外层的 `e.Next()` 就收到什么——nil 或 error。
+
+### 5.5 Model CRUD 中的真实错误传播链
 
 以 `app.Delete()` 为例，参见 [db.go#L110-L173](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L110-L173)：
 
-```
-1. 触发 OnModelDelete → 若 error → 转步骤 4
-2.   其中触发 OnModelDeleteExecute → 若 error → 转步骤 4
-3. 成功 → 触发 OnModelAfterDeleteSuccess（事务中则延迟到 commit 后）
-4. 失败 → 触发 OnModelAfterError，error 与 hookErr 通过 errors.Join 合并返回
+```go
+// 最外层：用户调用 app.Delete()
+deleteErr := app.OnModelDelete().Trigger(event, func(e *ModelEvent) error {
+    // oneOff 的前半：检查 PK
+    if pk == "" {
+        return errors.New("no pk")  // Next 前返回 → 前进中断
+    }
+    // oneOff 内嵌套触发另一条钩子链
+    return e.App.OnModelDeleteExecute().Trigger(event, func(e *ModelEvent) error {
+        // 最内层 oneOff：执行 DB DELETE
+        _, err := db.Delete(...).Execute()
+        return err  // DB 错误沿返回方向冒泡
+    })
+})
 ```
 
-### 5.3 错误合并
+错误传播路径：
 
-参见 [db.go#L141-L150](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L141-L150)：
+```
+1. DB DELETE 失败 → 最内层 oneOff 返回 err
+2. OnModelDeleteExecute 的返回方向冒泡
+3. OnModelDeleteExecute.Trigger() 返回 err
+4. 外层 oneOff 收到 err，直接 return（策略 1：透传）
+5. OnModelDelete 的返回方向冒泡
+6. OnModelDelete.Trigger() 返回 err → 赋值给 deleteErr
+```
+
+**关键理解**：`Trigger()` 的返回值就是整个洋葱链最外层 handler 的最终返回值。
+
+### 5.6 错误合并：AfterError 钩子的特殊处理
+
+CRUD 失败后，会触发独立的 `OnModelAfter*Error` 钩子，它的错误会与原始错误合并，参见 [db.go#L141-L150](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L141-L150)：
 
 ```go
 if deleteErr != nil {
     errEvent := &ModelErrorEvent{ModelEvent: *event, Error: deleteErr}
     hookErr := app.OnModelAfterDeleteError().Trigger(errEvent)
     if hookErr != nil {
-        return errors.Join(deleteErr, hookErr)  // 合并两个错误
+        return errors.Join(deleteErr, hookErr)  // 两个错误都保留
     }
     return deleteErr
 }
 ```
 
-**关键点**：即使 `OnModelAfterDeleteError` 的 Handler 也报错，原始错误 `deleteErr` 不会被覆盖，两者会通过 `errors.Join` 合并。
+这里是 **两条独立的钩子链**：
+- 第一条链 `OnModelDelete` 负责实际操作，返回 `deleteErr`
+- 第二条链 `OnModelAfterDeleteError` 负责错误后的回调，返回 `hookErr`
+- 两个错误通过 `errors.Join` 合并后返回，互不覆盖
 
-### 5.4 事务场景下的延迟触发
+### 5.7 事务场景下的延迟触发
 
-若操作在事务中（`app.txInfo != nil`），`AfterSuccess` / `AfterError` 钩子 **延迟到事务完成后** 才触发：
+若操作在事务中（`app.txInfo != nil`），`AfterSuccess` / `AfterError` 钩子 **延迟到事务完成后** 才触发，参见 [db.go#L152-L167](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L152-L167)：
 
 ```go
 if app.txInfo != nil {
     app.txInfo.OnComplete(func(txErr error) error {
         if txErr != nil {
+            // 事务回滚 → 触发 AfterError
             return app.OnModelAfterDeleteError().Trigger(...)
         }
+        // 事务提交 → 触发 AfterSuccess
         return app.OnModelAfterDeleteSuccess().Trigger(event)
     })
 }
@@ -452,6 +586,6 @@ routeHook.Trigger(event, v.Action)
 | 执行顺序 | Priority 升序 + `sort.SliceStable` 保持注册顺序 | [hook.go#L98-L101](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/hook.go#L98-L101) |
 | 链式调用 | 倒序构建闭包，通过 `event.next` 串联 | [hook.go#L164-L173](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/hook.go#L164-L173) |
 | 标签过滤 | TaggedHook 包装 Func，不匹配时跳过 | [tagged.go#L58-L69](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/tagged.go#L58-L69) |
-| 错误传播 | Handler 返回 error 即中断链条，向上冒泡 | [event.go#L30-L35](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/event.go#L30-L35) |
+| 错误传播 | Next 前返回 error 中断前进方向；Next 后返回 error 仅沿返回方向冒泡；外层可捕获 `e.Next()` 返回值决定透传/吞掉/包装 | [event.go#L30-L35](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/event.go#L30-L35)、[hook_test.go#L32](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/hook_test.go#L32) |
 | 事务延迟 | `txInfo.OnComplete` 回调中触发 After 钩子 | [db.go#L152-L167](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L152-L167) |
 | Model↔Record 桥接 | Priority=-99 的系统 Handler 做类型转换转发 | [record_model.go#L55-L288](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/record_model.go#L55-L288) |
