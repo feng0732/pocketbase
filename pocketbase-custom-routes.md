@@ -147,6 +147,45 @@ for each method on app that starts with "On":
     })
 ```
 
+### 2.3 HooksWatch 热重载机制
+
+[plugins/jsvm/jsvm.go#L365-L463](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/jsvm.go#L365-L463) 中 `watchHooks()` 的实现：
+
+#### 核心机制：非增量更新，而是全进程重启
+
+HooksWatch **不会**对已注册的路由或 Hook 做任何增量修改。当 `pb_hooks` 目录下文件发生变化时，它触发的是**整个应用进程的重启**。
+
+```
+watchHooks()
+├── 创建 fsnotify.Watcher
+├── 递归添加 pb_hooks 下所有非隐藏、非 node_modules 子目录
+│   └── filepath.WalkDir → watcher.Add(path)
+├── 注册 OnTerminate 钩子：关闭 watcher + 防抖定时器
+└── 启动 goroutine 监听事件
+    ├── 收到 watcher.Events:
+    │   ├── 启动/重置 50ms 防抖定时器
+    │   └── 定时器触发后：
+    │       ├── Windows: 打印黄色警告 "File xxx changed, please restart the app manually"
+    │       │   （因为 Windows 不支持 execve 替换进程）
+    │       └── 非 Windows: color.Yellow("restarting...") → p.app.Restart()
+    └── 收到 watcher.Errors: 打印红色错误
+```
+
+#### app.Restart() 的效果
+
+调用 `app.Restart()` 后：
+1. 当前进程通过 `syscall.Exec`（类 Unix）替换自身为新的进程镜像
+2. 新进程从头执行完整启动流程：
+   - `NewWithConfig()` → `core.NewBaseApp()` → 重新创建所有 Hook 实例
+   - `jsvm.Register()` → `registerHooks()` → 重新扫描 `pb_hooks`、重建 Loader/Executor VM、重新执行所有 JS 文件
+   - `serve` 命令 → `apis.Serve()` → `apis.NewRouter()` → `OnServe.Trigger()` → 重新注册所有路由
+3. 旧进程中已注册到 Hook 上的 JS 回调、VM 池中的 goja.Program、已编译的路由等全部随进程销毁
+
+**关键结论**：HooksWatch 不做路由卸载、Hook 解绑或 VM 热替换，它依赖操作系统级别的进程重启来达到"热重载"效果。这意味着：
+- Windows 用户必须手动重启进程，无法自动热重载
+- 已建立的 HTTP 连接会被中断
+- Cron 任务会重新调度
+
 ---
 
 ## 三、请求接入与路由匹配流程
@@ -413,7 +452,176 @@ app.OnServe().BindFunc(func(e *core.ServeEvent) error {
 })
 ```
 
-### 4.5 模块系统共享
+### 4.5 routerAdd/routerUse 与 on* hook 的执行上下文差异
+
+PocketBase JSVM 中有三类 JS 回调注册方式，它们的 `$app` 注入机制、执行时机和上下文环境完全不同。
+
+#### 三类注册方式对比
+
+| 维度 | `routerAdd` / `routerUse` | `onRecord*` / `onModel*` 等 on* hook | `cronAdd` |
+|------|--------------------------|--------------------------------------|-----------|
+| 绑定函数 | `routerBinds()` | `hooksBinds()` | `cronBinds()` |
+| 代码位置 | [binds.go#L149-L179](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L149-L179) | [binds.go#L42-L102](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L42-L102) | [binds.go#L104-L147](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L104-L147) |
+| 注册时机 | Loader VM 执行 JS 时 | Loader VM 执行 JS 时 | Loader VM 执行 JS 时 |
+| 执行时机 | HTTP 请求到达时 | 业务事件触发时（如记录创建） | Cron 定时器触发时 |
+| 包装函数 | `wrapHandlerFunc` / `wrapMiddlewares` | 反射生成的 `reflect.MakeFunc` | `app.Cron().Add()` 内联函数 |
+
+#### $app 注入方式的差异
+
+这是三类回调最关键的区别：
+
+##### 1. routerAdd/routerUse：Go 侧显式注入 e.App
+
+[plugins/jsvm/binds.go#L193-L207](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L193-L207) 中的 `wrapHandlerFunc`：
+
+```go
+wrappedHandler := func(e *core.RequestEvent) error {
+    return executors.run(func(executor *goja.Runtime) error {
+        // Go 侧在执行前显式设置 $app = RequestEvent.App
+        executor.Set("$app", e.App)       // ← 关键差异 1
+        executor.Set("__args", []any{e})
+        res, err := executor.RunProgram(pr)
+        executor.Set("__args", goja.Undefined())
+        // ...
+    })
+}
+```
+
+`wrapMiddlewares` 中对所有中间件的处理完全相同，见 [binds.go#L248-L263](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L248-L263) 和 [binds.go#L268-L283](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L268-L283)。
+
+**用户 JS 侧**：
+```javascript
+routerAdd("GET", "/api/test", (e) => {
+    // $app 由 Go 侧预先设置为 e.App
+    // e.app 同时也可用（RequestEvent 的字段）
+    console.log($app === e.app)  // true
+    return e.json(200, {})
+})
+```
+
+##### 2. on* hook：JS 侧包装函数从事件对象提取
+
+[plugins/jsvm/binds.go#L60-L63](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L60-L63) 中的 `hooksBinds`：
+
+```go
+loader.Set(jsName, func(callback string, tags ...string) {
+    // ★ 关键：在 JS 源码层面注入 $app 赋值
+    callback = `function(e) { $app = e.app; return (` + callback + `).call(undefined, e) }`
+    //                 ↑ 在 JS 执行时自己从 e.app 提取
+    
+    pr := goja.MustCompile(defaultScriptPath, 
+        "{("+callback+").apply(undefined, __args)}", true)
+    
+    // ... 反射获取 hookInstance ...
+    hookBindFunc.Call([]reflect.Value{handler})  // handler 内：
+    // └─ executor.Set("$app", goja.Undefined())  ← 先设为 undefined！
+    //    executor.Set("__args", handlerArgs)
+    //    executor.RunProgram(pr)  // → 执行包装后的 JS，JS 内部 $app = e.app
+    //    executor.Set("__args", goja.Undefined())
+})
+```
+
+**用户 JS 侧**：
+```javascript
+onRecordAfterCreateSuccess((e) => {
+    // 执行流程：
+    // 1. Go 侧 executor.Set("$app", undefined)
+    // 2. Go 侧 executor.Set("__args", [RecordEvent])
+    // 3. JS 侧：包装函数执行 → $app = e.app（从事件对象赋值）
+    // 4. JS 侧：调用用户 callback
+    console.log($app === e.app)  // true，但赋值时机不同
+})
+```
+
+**与 routerAdd 的本质区别**：
+- routerAdd：Go 侧在 RunProgram **之前**用 `executor.Set("$app", e.App)` 注入
+- on* hook：Go 侧先 `executor.Set("$app", undefined)`，然后靠**编译到 JS 源码里的赋值语句** `$app = e.app` 在 JS 运行时注入
+
+这个差异的原因是：on* hook 的事件类型很多（RecordEvent、ModelEvent、CollectionEvent、MailerEvent 等），Go 侧反射生成的通用 handler 不知道具体事件类型，无法在 Go 层面统一提取 `.App` 字段，所以把赋值逻辑下沉到了 JS 侧。
+
+##### 3. cronAdd：完全不注入 $app
+
+[plugins/jsvm/binds.go#L105-L121](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L105-L121)：
+
+```go
+cronAdd := func(jobId, cronExpr, handler string) {
+    pr := goja.MustCompile(defaultScriptPath, "{("+handler+").apply(undefined)}", true)
+    //                                                               ↑ 无参数！
+    
+    err := app.Cron().Add(jobId, cronExpr, func() {
+        err := executors.run(func(executor *goja.Runtime) error {
+            // ★ 完全没有 Set("$app", ...)！
+            // 也没有 Set("__args", ...)
+            _, err := executor.RunProgram(pr)
+            return err
+        })
+        // ...
+    })
+}
+```
+
+**用户 JS 侧**：
+```javascript
+cronAdd("myJob", "* * * * *", () => {
+    // $app 使用的是 sharedBinds 中设置的默认全局值（启动时的 App 实例）
+    // 没有 e 参数，无法从事件对象获取
+    // cronAdd/cronRemove 函数在 executor VM 中也被绑定
+})
+```
+
+注意 `cronBinds` 还额外修改了 executors 的 factory，将 `cronAdd` / `cronRemove` 注入到**所有 executor VM**中，见 [binds.go#L133-L146](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/binds.go#L133-L146)。
+
+#### sharedBinds 中的默认 $app
+
+[plugins/jsvm/jsvm.go#L288-L312](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/jsvm.go#L288-L312) 中所有 VM 创建时都会执行：
+
+```go
+sharedBinds := func(vm *goja.Runtime) {
+    // ...
+    vm.Set("$app", p.app)  // ← 启动时的 App 实例作为默认值
+    vm.Set("$template", templateRegistry)
+    vm.Set("__hooks", absHooksDir)
+}
+```
+
+这个默认值在不同场景下的有效性：
+- **routerAdd/routerUse**：每次执行前被 `executor.Set("$app", e.App)` 覆盖
+- **on* hook**：每次执行前被 `executor.Set("$app", undefined)` 覆盖，之后 JS 包装函数又从 `e.app` 重新赋值
+- **cronAdd**：使用这个默认值（因为 Cron handler 中不修改 $app）
+
+#### 执行上下文差异总结
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   VM 初始状态（sharedBinds）                     │
+│  $app = p.app（启动时实例）                                      │
+│  __args = undefined                                             │
+│  require / $http / $os 等全局就绪                                │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │
+          ┌────────────┼─────────────────┐
+          ▼            ▼                 ▼
+     routerAdd     on* hook          cronAdd
+     routerUse
+          │            │                 │
+          ▼            ▼                 ▼
+  Set("$app", e.App)  Set("$app",       不修改 $app
+  Set("__args", [e])  undefined)        不设置 __args
+                       Set("__args",
+                       [event])
+          │            │                 │
+          ▼            ▼                 ▼
+  RunProgram(pr)   RunProgram(pr)     RunProgram(pr)
+  └─ 用户 JS 直接   └─ 包装 JS 先执行   └─ 用户 JS 直接执行
+     执行             $app = e.app
+                     └─ 再执行用户 JS
+          │            │                 │
+          ▼            ▼                 ▼
+  Set("__args",     Set("__args",       (无清理)
+  undefined)        undefined)
+```
+
+### 4.6 模块系统共享
 
 - `require.Registry` 在所有 VM 间共享（模块缓存全局共用）
 - `template.Registry` 同样全局共享
