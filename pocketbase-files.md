@@ -249,6 +249,11 @@ func (f *FileField) subtractValue(record *Record, toRemove any) {
 
 **关键点**：新上传的 `*filesystem.File` 在 `extractUploadedFiles` 阶段就已经完成了文件名规范化（`tools/filesystem/file.go#L195-L236` 的 `normalizeName()`），文件名格式为 `{cleanName}_{10位随机字符}{.ext}`，不是用户上传时的原始文件名。
 
+**去重保证**：`toSliceValue()`（`core/field_file.go#L728-L758`）在返回前**始终调用** `uniqueFiles()`（`core/field_file.go#L760-L773`）做去重。`uniqueFiles` 基于 `getFileName()`（`core/field_file.go#L816-L825`）提取文件名（对 `string` 直接取值，对 `*filesystem.File` 取 `.Name`），**保留首次出现的元素，丢弃后续同名的**。这意味着：
+- 所有 setter 最终都经过 `setValue` → `normalizeValue` → `toSliceValue` → `uniqueFiles`，**不会产生重复文件名**
+- 当 `prependValue` 把同名文件头插时，原位置的旧引用会被丢弃（因为头插的先出现）
+- 当 `appendValue` 把同名文件尾插时，新插入的会被丢弃（因为原位置的先出现）
+
 ### 3.6 修饰符与校验的协作：为什么不能凭空新增纯字符串
 
 `ReplaceModifiers` 阶段只做列表组装，不做安全校验。真正的安全检查在 `FileField.ValidateValue()`（`core/field_file.go#L250-L269`）：
@@ -302,6 +307,8 @@ func (f *FileField) subtractValue(record *Record, toRemove any) {
 
 当两个修饰符操作**同一个已有文件**时，执行顺序会影响最终结果。这种情况通常发生在使用纯字符串文件名对已有文件进行重排的场景：
 
+> **去重机制**：`toSliceValue()` 在返回前**始终调用** `uniqueFiles()`（`core/field_file.go#L760-L773`）做去重——基于 `getFileName()` 提取文件名，**保留首次出现的元素，丢弃后续同名的**。因此所有 setter（`setValue`/`prependValue`/`appendValue`/`subtractValue`）最终都经过 `setValue` → `normalizeValue` → `toSliceValue` → `uniqueFiles`，**不会产生重复文件名**。
+
 ```
 假设 DB 中 documents = ["old_a.jpg", "old_b.jpg"]
 
@@ -312,17 +319,26 @@ func (f *FileField) subtractValue(record *Record, toRemove any) {
 两种可能的执行顺序，结果不同:
 
   先 +documents 后 documents-:
-    1. +documents  → ["old_b.jpg", "old_a.jpg", "old_b.jpg"]   （有重复）
-    2. documents-  → ["old_a.jpg"]                              （删除所有 old_b.jpg）
+    1. +documents:
+       拼接: ["old_b.jpg"] + ["old_a.jpg", "old_b.jpg"]
+       去重(uniqueFiles 保留首次出现): ["old_b.jpg", "old_a.jpg"]
+       （原位置的 old_b.jpg 被丢弃，因为头插的已占位）
+    2. documents-:
+       排除 old_b.jpg: ["old_a.jpg"]
     结果: ["old_a.jpg"]
 
   先 documents- 后 +documents:
-    1. documents-  → ["old_a.jpg"]                              （删除 old_b.jpg）
-    2. +documents  → ["old_b.jpg", "old_a.jpg"]                 （头插 old_b.jpg）
+    1. documents-:
+       排除 old_b.jpg: ["old_a.jpg"]
+    2. +documents:
+       拼接: ["old_b.jpg"] + ["old_a.jpg"]
+       去重: ["old_b.jpg", "old_a.jpg"]  （无重复，不需要丢弃）
     结果: ["old_b.jpg", "old_a.jpg"]
 ```
 
 > **说明**：`+documents = ["old_b.jpg"]` 中的 `old_b.jpg` 是纯字符串，但它在旧值中已存在，因此**不会**被 `ValidateValue` 拒绝（只拦"新增的"纯字符串，不拦已有的）。
+>
+> `uniqueFiles` 的"保留首次出现"规则意味着：头插同名文件时，原位置的旧引用会被丢弃，而不是产生重复。但执行顺序仍然决定了最终列表中有无该文件——先头插后删除会把文件移到最前再整个删掉，先删除后头插则只是挪了位置。
 
 > **实践建议**：
 > - 真实场景中 `documents+`（新上传 `*File`）+ `documents-`（删旧文件字符串）的组合最常见，由于新旧文件名不重叠（新文件有随机后缀），结果通常一致，但顺序仍然是不确定的，不能依赖。
@@ -694,14 +710,16 @@ app.NewFilesystem()
 
 2. **修饰符通用机制**：`SetterFinder` / `FindSetter` 让每个字段类型自定义 key 模式（`+field`、`field+`、`field-`、`:autogenerate` 等），`ReplaceModifiers` **仅按 key 长度升序排序**——长度不同时有确定顺序（短 key 先处理），**相同长度修饰符的先后顺序不保证**（依赖 Go map 的随机遍历顺序）。
 
-3. **先文件后 DB**：上传成功才写 DB，DB 失败回滚文件，从根源避免"DB 有引用但文件不存在"的脏状态。
+3. **自动去重**：`uniqueFiles()` 在 `toSliceValue()` 返回前始终执行，基于文件名去重，保留首次出现，丢弃后续同名。所有 setter 都经过此路径，**不会产生重复文件名**。但去重"保留首次出现"的规则与修饰符执行顺序耦合——头插同名文件时保留新位置、尾插同名文件时保留旧位置。
 
-4. **三级删除保障**：字段级差异检测 → 修饰符显式删除 → 模型级目录清理，覆盖所有文件生命周期。
+4. **先文件后 DB**：上传成功才写 DB，DB 失败回滚文件，从根源避免"DB 有引用但文件不存在"的脏状态。
 
-5. **异步+限流的批量删除**：Record/Collection 删除用信号量+后台协程执行，避免大目录删除阻塞事务。
+5. **三级删除保障**：字段级差异检测 → 修饰符显式删除 → 模型级目录清理，覆盖所有文件生命周期。
 
-6. **Driver 接口极小化**：8 个方法即可新增存储后端，上层 System/Bucket 逻辑 100% 复用。
+6. **异步+限流的批量删除**：Record/Collection 删除用信号量+后台协程执行，避免大目录删除阻塞事务。
 
-7. **本地写入原子性**：临时文件 + `os.Rename()` 确保不会出现半写入的损坏文件。
+7. **Driver 接口极小化**：8 个方法即可新增存储后端，上层 System/Bucket 逻辑 100% 复用。
 
-8. **动态驱动切换**：每次 `NewFilesystem()` 都重新读 Settings，S3 配置变更即时生效，无需重启服务。
+8. **本地写入原子性**：临时文件 + `os.Rename()` 确保不会出现半写入的损坏文件。
+
+9. **动态驱动切换**：每次 `NewFilesystem()` 都重新读 Settings，S3 配置变更即时生效，无需重启服务。
