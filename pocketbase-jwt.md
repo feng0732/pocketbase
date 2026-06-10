@@ -471,6 +471,42 @@ func (m *Record) RefreshTokenKey() {
 
 它利用 `TextField` 的 `:autogenerate` 修饰符机制（定义见 [core/field_text.go#L383-L393](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/field_text.go#L383-L393)），在字段真正落库前生成随机字符串。
 
+### 8.1.1 Collection 级 AuthToken.Secret 的刷新触发点
+
+除了 Record 级 `tokenKey`，Collection 级的 `AuthToken.Secret` 也存在自动刷新机制。触发位置在 [core/collection_model.go#L846-L866](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/collection_model.go#L846-L866) 的 `onCollectionSaveExecute`：
+
+```go
+func onCollectionSaveExecute(e *CollectionEvent) error {
+    // ...
+    if !e.Collection.IsNew() {
+        oldCollection, err := e.App.FindCachedCollectionByNameOrId(e.Collection.Id)
+        // ...
+
+        // invalidate previously issued auth tokens on auth rule change
+        if oldCollection.AuthRule != e.Collection.AuthRule &&
+            cast.ToString(oldCollection.AuthRule) != cast.ToString(e.Collection.AuthRule) {
+            e.Collection.AuthToken.Secret = security.RandomString(50)
+        }
+    }
+    // ... 事务内保存 Collection
+}
+```
+
+**触发条件（两个必须同时满足）：**
+
+| 条件 | 说明 |
+|---|---|
+| `!e.Collection.IsNew()` | 是已有 Collection 的 Update，不是首次 Create |
+| `oldCollection.AuthRule != new.AuthRule`（指针不同） **且** `cast.ToString` 值也不同 | AuthRule 的实际内容发生了变化 |
+
+这里用了双重检查：先比指针（处理 `nil` → 非 `nil` 的变化），再用 `cast.ToString` 比实际字符串值（`cast.ToString(nil) == ""`），覆盖以下所有变化：
+- `nil` → `""`（禁止认证 → 允许所有人）
+- `""` → `"verified = true"`（放开 → 收紧规则）
+- `"verified = true"` → `"role = 'admin'"（规则内容变更）
+- `"verified = true"` → `nil`（收紧 → 禁止认证）
+
+**一旦触发，AuthToken.Secret 被替换为全新随机字符串 → 该 Collection 下所有用户的所有已签发 Auth Token 在下次请求验签时全部失败（因为验签密钥 `record.TokenKey() + NEW_Secret` 与签发时用的 `record.TokenKey() + OLD_Secret` 不匹配）。
+
 ### 8.2 各类场景对 Token 有效性的影响
 
 下面逐一分析各种用户操作对 **已签发 Token** 的影响：
@@ -536,30 +572,35 @@ if err := e.App.Save(e.Record); err != nil { ... }
 
 同样的逻辑适用于其他 Token 类型的 Secret：`PasswordResetToken.Secret`、`EmailChangeToken.Secret`、`VerificationToken.Secret`、`FileToken.Secret`——修改后对应的 Token 全部作废。
 
-#### ❌ 场景四：修改 AuthRule → **已签发 Token 不会立即失效**
+#### ✅ 场景四：修改 AuthRule → **该 Collection 所有用户的所有旧 Token 立即失效**
 
-AuthRule 的校验位置在 [apis/record_helpers.go#L58-L61](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_helpers.go#L58-L61)：
+**触发路径**（完全由框架自动处理，无需手动操作）：
 
-```go
-ok, err := e.App.CanAccessRecord(authRecord, originalRequestInfo, authRecord.Collection().AuthRule)
-if !ok {
-    return firstApiError(err, e.ForbiddenError("The request doesn't satisfy the collection requirements to authenticate.", err))
-}
-```
+1. 管理员通过 UI 或 API 修改 Collection 的 `AuthRule`（例如从 `""` 改为 `"verified = true"`）
+2. `Save(collection)` → 进入 `onCollectionSaveExecute`（[core/collection_model.go#L846-L866](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/collection_model.go#L846-L866)）
+3. 检测到 `oldCollection.AuthRule ≠ new.AuthRule`（双重检查：指针 + `cast.ToString` 值）
+4. **自动执行** `e.Collection.AuthToken.Secret = security.RandomString(50)` 替换为全新随机密钥
+5. 新的 `AuthToken.Secret` 随 Collection 配置写入数据库
+6. 下一次任何用户请求进来时，`loadAuthToken` → `FindAuthRecordByToken`：
+   ```go
+   // core/record_query.go#L516-L518
+   case TokenTypeAuth:
+       baseTokenKey = record.Collection().AuthToken.Secret  // ← 读取的是 NEW Secret
+   // ...
+   secret := record.TokenKey() + baseTokenKey
+   _, err = security.ParseJWT(token, secret)  // ← 旧 Token 用 OLD Secret 签发，验签失败 → return nil
+   ```
+7. `FindAuthRecordByToken` 返回 nil → `e.Auth` 为 nil → 下游 `RequireAuth` 返回 401
 
-这段代码**只在签发新 Token 时执行**（即 `RecordAuthResponse` 里），包括：
-- 密码登录、OAuth2 登录、OTP 登录
-- Token 刷新（`auth-refresh` 也走 `recordAuthResponse`）
+**为什么要这样设计？** AuthRule 代表"谁可以登录"的业务规则，一旦规则变化（如收紧为仅已验证用户），必须保证所有已登录但不再符合新规则的用户被立刻踢下线。通过刷新 Collection Secret 可以一次性、原子性地吊销该 Collection 下**所有**已签发 Token，而无需逐条处理用户记录。
 
-而普通受保护请求的 `loadAuthToken` 只做验签和查 Record，**不会再次执行 AuthRule 校验**。
+> 💡 AuthRule 的规则校验（`CanAccessRecord`）仍然存在于 [apis/record_helpers.go#L58-L61](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_helpers.go#L58-L61)，但只在**签发新 Token**时（登录/刷新）执行。它是"准入检查"，而 Secret 刷新是"已准入用户的批量驱逐"——两层防线配合。
 
-所以：
-- 管理员把 AuthRule 从 `""`（允许所有人）收紧为 `"verified = true"` → 已登录的未验证用户还能继续用现有 Token
-- 这些用户等到 Token 过期或主动刷新时，才会被 AuthRule 拦下
+#### ❌ 场景五：单独修改 verified 状态 → **已签发 Token 不会立即失效**
 
-#### ❌ 场景五：修改 verified 状态（仅）→ **已签发 Token 不会立即失效**
+改 verified 字段走正常的 Record Update，但 `onRecordSaveExecute` 只检测 password 和 email 变化，不检测 verified。所以 verified 变化 **不会触发 `RefreshTokenKey()`**，已签发 Token 的验签密钥不变 → Token 继续有效。
 
-改 verified 字段走正常的 Record Update，但 `onRecordSaveExecute` 只检测 password 和 email 变化，不检测 verified。所以 verified 变化 **不会触发 `RefreshTokenKey()`**。
+> ⚠️ **注意**：如果管理员同时修改了 `AuthRule`（例如加上 `"verified = true"`），那么会走**场景四**的路径——`onCollectionSaveExecute` 检测到 AuthRule 变化 → 自动刷新 `AuthToken.Secret` → 整个 Collection 所有用户的 Token 全部失效。也就是说，真正让用户下线的是 AuthRule 变更，而不是 verified 字段本身的变更。
 
 但有一种特殊情况：**邮箱验证确认时如果 PasswordAuth 未启用**，见 [apis/record_auth_verification_confirm.go#L50-L53](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_auth_verification_confirm.go#L50-L53)：
 
@@ -593,12 +634,12 @@ if v, ok := claims[core.TokenClaimRefreshable]; ok && cast.ToBool(v) {
 
 | 操作 | 触发者 | tokenKey 变化？ | Collection Secret 变化？ | 已签发 Token 是否失效 |
 |---|---|---|---|---|
-| 用户修改密码 | 用户/管理员 | ✅ 刷新 | ❌ | ✅ **全部失效** |
-| 用户重置密码（忘记密码） | 用户 | ✅ 刷新 | ❌ | ✅ **全部失效** |
-| 邮箱变更（确认后） | 用户 | ✅ 刷新 | ❌ | ✅ **全部失效** |
+| 用户修改密码 | 用户/管理员 | ✅ 刷新 | ❌ | ✅ **该用户全部失效** |
+| 用户重置密码（忘记密码） | 用户 | ✅ 刷新 | ❌ | ✅ **该用户全部失效** |
+| 邮箱变更（确认后） | 用户 | ✅ 刷新 | ❌ | ✅ **该用户全部失效** |
 | 管理员改 Collection.AuthToken.Secret | 管理员 | ❌ | ✅ 变化 | ✅ **该 Collection 全部用户失效** |
-| 管理员改 AuthRule（如 `verified = true`） | 管理员 | ❌ | ❌ | ❌ 仅下次签发/刷新才校验 |
-| 管理员改 verified 字段 | 管理员 | ❌* | ❌ | ❌ 下次刷新才拦截 |
+| 管理员改 AuthRule（如 `verified = true`） | 管理员 | ❌ | ✅ **自动刷新** | ✅ **该 Collection 全部用户失效** |
+| 管理员改 verified 字段（单独改） | 管理员 | ❌ | ❌ | ❌ Token 继续有效（需配合 AuthRule 变更才会拦截） |
 | 纯 OAuth2 用户首次邮箱验证 | 用户 | ✅* | ❌ | ✅* 因 SetRandomPassword 间接刷新 |
 | 修改普通字段（name/avatar 等） | 用户 | ❌ | ❌ | ❌ Token 继续有效 |
 | Token 自然过期 | 时间 | ❌ | ❌ | ✅ exp 校验失败 |
@@ -612,18 +653,29 @@ if v, ok := claims[core.TokenClaimRefreshable]; ok && cast.ToBool(v) {
         │
         ├── T1 (T0+1d)  正常请求 ──► loadAuthToken 验签通过 ──► 200 OK
         │
-        ├── T2 (T0+2d)  修改密码 ──► RefreshTokenKey() ──► TokenA 立即失效
+        ├── T2 (T0+2d)  修改密码 ──► RefreshTokenKey() ──► TokenA 立即失效（仅该用户）
         │                              │
         │                              └── T2+1 用 TokenA 请求 ──► 验签密钥不匹配 ──► 401
         │
+        ├── T2' (T0+2.5d) 管理员改 AuthRule ──► onCollectionSaveExecute 自动刷新 AuthToken.Secret
+        │      (如从 "" 改为 "verified = true")        │
+        │                                                └── 该 Collection ALL 用户 Token 全部失效
+        │                                                     │
+        │                                                     └── 任意用户下次请求 ──► 401
+        │
         └── T3 (T0+3d)  /auth-refresh
                │
-               ├─ 如果 TokenA 还在（假设没改密码）
+               ├─ 如果 TokenA 还在（假设没改密码、AuthRule 也没变）
                │    └─ ParseUnverifiedJWT 检查 refreshable=true ──► 签发 TokenB (exp=T3+5d)
                │
-               └─ 如果 TokenA 已因改密码失效
+               └─ 如果 TokenA 已因改密码 / AuthRule 变更失效
                     └─ loadAuthToken 阶段就 401，根本到不了 auth-refresh handler
 ```
+
+**关键区别：**
+- 密码/邮箱变更 → 触发 `Record.tokenKey` 刷新 → **仅该用户** 的 Token 失效（粒度细）
+- AuthRule 变更 → 触发 `Collection.AuthToken.Secret` 自动刷新 → **该 Collection 所有用户** 的 Token 失效（批量驱逐）
+- 两种机制最终都会让 `FindAuthRecordByToken` 中的 `security.ParseJWT(token, record.TokenKey() + Secret)` 验签失败
 
 ---
 
@@ -632,10 +684,12 @@ if v, ok := claims[core.TokenClaimRefreshable]; ok && cast.ToBool(v) {
 | 设计 | 位置 | 作用 |
 |---|---|---|
 | HS256 白名单 | [tools/security/jwt.go#L29](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/tools/security/jwt.go#L29) | 防 `alg=none` 攻击 |
-| Record 级 tokenKey | [core/record_tokens.go#L56](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/record_tokens.go#L56) | 改密码即吊销所有旧 Token，无需服务端黑名单 |
-| Collection 级 Secret | [core/collection_model_auth_options.go#L71-L90](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/collection_model_auth_options.go#L71-L90) | 每种用途独立密钥，隔离风险 |
+| Record 级 tokenKey（密码/邮箱变更自动刷新） | [core/record_model.go#L1445-L1448](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/record_model.go#L1445-L1448) | 单用户级会话吊销：改密码/改邮箱即该用户所有旧 Token 失效，无需服务端黑名单 |
+| Collection 级 AuthToken.Secret（AuthRule 变更自动刷新） | [core/collection_model.go#L861-L865](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/collection_model.go#L861-L865) | 全局级批量驱逐：改 AuthRule 时自动刷新 Secret → 该 Collection **所有用户**的所有 Token 立即失效 |
+| Collection 级多用途独立 Secret | [core/collection_model_auth_options.go#L71-L90](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/collection_model_auth_options.go#L71-L90) | Auth / File / Verification / PasswordReset / EmailChange 各有独立密钥，风险隔离 |
 | bcrypt 密码哈希 | [core/field_password.go#L322](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/field_password.go#L322) | 抗彩虹表、抗暴力破解 |
 | dummyPasswordCheck | [apis/record_auth_with_password.go#L125-L136](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_auth_with_password.go#L125-L136) | 用户枚举时序攻击防护 |
 | 统一错误消息 | [apis/record_auth_with_password.go#L93](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_auth_with_password.go#L93) | 不区分"用户不存在"与"密码错误" |
 | Token 不从 URL 读取 | [apis/middlewares.go#L212](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/middlewares.go#L212) | 避免 Token 出现在 Referer、日志中 |
 | loadAuthToken 不直接报错 | [apis/middlewares.go#L200-L201](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/middlewares.go#L200-L201) | 允许公开+私有混合路由，便于扩展自定义鉴权 |
+| AuthRule 双重防线 | 签发时校验 ([apis/record_helpers.go#L58-L61](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_helpers.go#L58-L61)) + 规则变更时全局吊销 ([core/collection_model.go#L861-L865](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/collection_model.go#L861-L865)) | 新登录用规则拦截准入，规则变更时用 Secret 刷新驱逐已登录用户 |
