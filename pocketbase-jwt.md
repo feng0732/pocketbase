@@ -492,20 +492,56 @@ func onCollectionSaveExecute(e *CollectionEvent) error {
 }
 ```
 
-**触发条件（两个必须同时满足）：**
+**触发条件（三个条件必须同时满足）：**
 
 | 条件 | 说明 |
 |---|---|
 | `!e.Collection.IsNew()` | 是已有 Collection 的 Update，不是首次 Create |
-| `oldCollection.AuthRule != new.AuthRule`（指针不同） **且** `cast.ToString` 值也不同 | AuthRule 的实际内容发生了变化 |
+| ① `oldCollection.AuthRule != e.Collection.AuthRule` | 指针不同（`*string` 类型，两个 `*string` 变量比较的是内存地址） |
+| ② `cast.ToString(old) != cast.ToString(new)` | **实际字符串值**也不同 |
 
-这里用了双重检查：先比指针（处理 `nil` → 非 `nil` 的变化），再用 `cast.ToString` 比实际字符串值（`cast.ToString(nil) == ""`），覆盖以下所有变化：
-- `nil` → `""`（禁止认证 → 允许所有人）
-- `""` → `"verified = true"`（放开 → 收紧规则）
-- `"verified = true"` → `"role = 'admin'"（规则内容变更）
-- `"verified = true"` → `nil`（收紧 → 禁止认证）
+条件①②是 **逻辑 AND** 关系——必须同时成立才刷新 Secret。
 
-**一旦触发，AuthToken.Secret 被替换为全新随机字符串 → 该 Collection 下所有用户的所有已签发 Auth Token 在下次请求验签时全部失败（因为验签密钥 `record.TokenKey() + NEW_Secret` 与签发时用的 `record.TokenKey() + OLD_Secret` 不匹配）。
+---
+
+### `cast.ToString` 对 `*string` 的行为
+
+`cast.ToString` 来自 `github.com/spf13/cast`，对 `*string` 的处理规则：
+- `cast.ToString(nil)` → 返回 `""`（空字符串）
+- `cast.ToString(&"")` → 返回 `""`（空字符串指针解引用后是空字符串）
+- `cast.ToString(&"verified = true")` → 返回 `"verified = true"`
+
+这意味着 `nil` 和 `&""`（指向空字符串的指针）在 `cast.ToString` 下**值相等**，都是 `""`。
+
+---
+
+### 全部 9 种边界组合的真值表
+
+AuthRule 字段类型是 `*string`，在 [core/collection_model_auth_options.go#L109](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/collection_model_auth_options.go#L109) 中定义。以下是所有可能的变化组合：
+
+| # | 旧值 | 新值 | ① 指针不同？ | ② `cast.ToString` 值不同？ | ① AND ② | Secret 刷新？ |
+|---|---|---|---|---|---|---|
+| 1 | `nil` | `nil` | ❌（均为 nil） | `""` vs `""` → ❌ | false | ❌ |
+| 2 | `nil` | `&""` | ✅（nil vs 非 nil） | `""` vs `""` → ❌ | **false** | **❌ 不刷新** |
+| 3 | `nil` | `&"verified = true"` | ✅ | `""` vs `"verified = true"` → ✅ | true | ✅ |
+| 4 | `&""` | `nil` | ✅（非 nil vs nil） | `""` vs `""` → ❌ | **false** | **❌ 不刷新** |
+| 5 | `&""` | `&""` | ❌（同指针） | `""` vs `""` → ❌ | false | ❌ |
+| 6 | `&""` | `&"verified = true"` | ✅ | `""` vs `"verified = true"` → ✅ | true | ✅ |
+| 7 | `&"verified = true"` | `nil` | ✅ | `"verified = true"` vs `""` → ✅ | true | ✅ |
+| 8 | `&"verified = true"` | `&""` | ✅ | `"verified = true"` vs `""` → ✅ | true | ✅ |
+| 9 | `&"verified = true"` | `&"role = 'admin'"` | ✅ | `"verified = true"` vs `"role = 'admin'"` → ✅ | true | ✅ |
+
+**关键边界（#2 和 #4）：`nil` ↔ `&""` 互转不会触发 Secret 刷新。**
+
+尽管从语义上看：
+- `nil` = "完全禁止该 Collection 的认证"（代码注释：*disallow authentication altogether*）
+- `&""` = "允许所有 auth record 认证"（空规则 = 无限制）
+
+两者语义完全不同，但由于 `cast.ToString(nil) == cast.ToString(&"") == ""`，条件②始终为 false，AND 整体短路为 false，不会刷新 Secret。这是一个有意为之的边界优化：`nil ↔ ""` 之间的切换通常不会产生需要吊销的有效 Token（`nil` 时根本无法登录），故无需触发全局吊销。
+
+---
+
+**一旦触发**，AuthToken.Secret 被替换为全新随机字符串 → 该 Collection 下所有用户的所有已签发 Auth Token 在下次请求验签时全部失败（因为验签密钥 `record.TokenKey() + NEW_Secret` 与签发时用的 `record.TokenKey() + OLD_Secret` 不匹配）。
 
 ### 8.2 各类场景对 Token 有效性的影响
 
@@ -572,14 +608,16 @@ if err := e.App.Save(e.Record); err != nil { ... }
 
 同样的逻辑适用于其他 Token 类型的 Secret：`PasswordResetToken.Secret`、`EmailChangeToken.Secret`、`VerificationToken.Secret`、`FileToken.Secret`——修改后对应的 Token 全部作废。
 
-#### ✅ 场景四：修改 AuthRule → **该 Collection 所有用户的所有旧 Token 立即失效**
+#### ✅ 场景四：修改 AuthRule（规则内容实际变化时）→ **该 Collection 所有用户的所有旧 Token 立即失效**
+
+> ⚠️ **边界例外**：`nil` ↔ `&""`（禁止认证 ↔ 允许所有人）互转时**不会**触发 Secret 刷新（详见 8.1.1 节的 9 种组合真值表）。
 
 **触发路径**（完全由框架自动处理，无需手动操作）：
 
-1. 管理员通过 UI 或 API 修改 Collection 的 `AuthRule`（例如从 `""` 改为 `"verified = true"`）
+1. 管理员通过 UI 或 API 修改 Collection 的 `AuthRule`（例如从 `""` 改为 `"verified = true"`，或 `"role = 'admin'"` 改为 `nil`）
 2. `Save(collection)` → 进入 `onCollectionSaveExecute`（[core/collection_model.go#L846-L866](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/collection_model.go#L846-L866)）
-3. 检测到 `oldCollection.AuthRule ≠ new.AuthRule`（双重检查：指针 + `cast.ToString` 值）
-4. **自动执行** `e.Collection.AuthToken.Secret = security.RandomString(50)` 替换为全新随机密钥
+3. 双重检查：`old != new`（指针）**AND** `cast.ToString(old) != cast.ToString(new)`（值）
+4. 两者都为 true 时 → **自动执行** `e.Collection.AuthToken.Secret = security.RandomString(50)` 替换为全新随机密钥
 5. 新的 `AuthToken.Secret` 随 Collection 配置写入数据库
 6. 下一次任何用户请求进来时，`loadAuthToken` → `FindAuthRecordByToken`：
    ```go
@@ -592,7 +630,7 @@ if err := e.App.Save(e.Record); err != nil { ... }
    ```
 7. `FindAuthRecordByToken` 返回 nil → `e.Auth` 为 nil → 下游 `RequireAuth` 返回 401
 
-**为什么要这样设计？** AuthRule 代表"谁可以登录"的业务规则，一旦规则变化（如收紧为仅已验证用户），必须保证所有已登录但不再符合新规则的用户被立刻踢下线。通过刷新 Collection Secret 可以一次性、原子性地吊销该 Collection 下**所有**已签发 Token，而无需逐条处理用户记录。
+**为什么要这样设计？** AuthRule 代表"谁可以登录"的业务规则，一旦规则内容实际发生变化（如从放开改为仅已验证用户），必须保证所有已登录但不再符合新规则的用户被立刻踢下线。通过刷新 Collection Secret 可以一次性、原子性地吊销该 Collection 下**所有**已签发 Token，而无需逐条处理用户记录。
 
 > 💡 AuthRule 的规则校验（`CanAccessRecord`）仍然存在于 [apis/record_helpers.go#L58-L61](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_helpers.go#L58-L61)，但只在**签发新 Token**时（登录/刷新）执行。它是"准入检查"，而 Secret 刷新是"已准入用户的批量驱逐"——两层防线配合。
 
@@ -638,7 +676,7 @@ if v, ok := claims[core.TokenClaimRefreshable]; ok && cast.ToBool(v) {
 | 用户重置密码（忘记密码） | 用户 | ✅ 刷新 | ❌ | ✅ **该用户全部失效** |
 | 邮箱变更（确认后） | 用户 | ✅ 刷新 | ❌ | ✅ **该用户全部失效** |
 | 管理员改 Collection.AuthToken.Secret | 管理员 | ❌ | ✅ 变化 | ✅ **该 Collection 全部用户失效** |
-| 管理员改 AuthRule（如 `verified = true`） | 管理员 | ❌ | ✅ **自动刷新** | ✅ **该 Collection 全部用户失效** |
+| 管理员改 AuthRule（规则内容实际变化） | 管理员 | ❌ | ✅ **自动刷新** | ✅ **该 Collection 全部用户失效**（`nil ↔ ""` 互转除外） |
 | 管理员改 verified 字段（单独改） | 管理员 | ❌ | ❌ | ❌ Token 继续有效（需配合 AuthRule 变更才会拦截） |
 | 纯 OAuth2 用户首次邮箱验证 | 用户 | ✅* | ❌ | ✅* 因 SetRandomPassword 间接刷新 |
 | 修改普通字段（name/avatar 等） | 用户 | ❌ | ❌ | ❌ Token 继续有效 |
