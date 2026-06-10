@@ -140,13 +140,37 @@ if e.Auth != nil && e.Auth.Collection().Id == collection.Id {
 
 ```go
 type recordOAuth2LoginForm struct {
+    collection   *core.Collection
     CreateData   map[string]any
     Provider     string   // 必填，长度 ≤ 100
     Code         string   // 必填
     CodeVerifier string
-    RedirectURL  string   // 必填
+    RedirectURL  string   // 必填（新字段，推荐）
+    RedirectUrl  string   // 已废弃（旧字段，兼容 v0.22 之前版本）
 }
 ```
+
+**字段 tag**：
+- `RedirectURL` → `form:"redirectURL" json:"redirectURL"`
+- `RedirectUrl` → `form:"redirectUrl" json:"redirectUrl"`
+
+#### `redirectUrl` → `redirectURL` 的兼容处理
+
+在 `e.BindBody(form)` 解析完请求体之后、`form.validate()` 校验之前，执行了一次旧字段到新字段的兼容迁移：
+
+```go
+if form.RedirectUrl != "" && form.RedirectURL == "" {
+    e.App.Logger().Warn("[recordAuthWithOAuth2] redirectUrl body param is deprecated and will be removed in the future. Please replace it with redirectURL.")
+    form.RedirectURL = form.RedirectUrl
+}
+```
+
+**代码位置**：`apis/record_auth_with_oauth2.go` 第 53-56 行
+
+> 💡 **兼容策略**：
+> - 仅当旧字段有值、新字段为空时才做迁移，避免新字段值被覆盖
+> - 迁移同时打一条 Warn 日志，提示开发者尽快切换到新字段
+> - `validate()` 只校验 `RedirectURL` 非空，旧字段不参与校验
 
 校验逻辑：
 
@@ -402,13 +426,68 @@ txApp.Save(optExternalAuth)
 
 ## 六、阶段 5：Token 生成与会话落地全链路
 
-### 6.1 Token 生成过程（签发端）
+会话落地的入口是 `apis/record_helpers.go` 中的 `RecordAuthResponse`。这是所有认证方式（password / oauth2 / otp / refresh）共用的统一出口，内部执行顺序**严格如下**，任何一步失败都会提前返回：
 
-会话落地的入口是 `apis/record_helpers.go` 中的 `RecordAuthResponse`：
+---
+
+### 6.1 执行顺序总览（代码级精确顺序）
+
+```
+RecordAuthResponse(e, authRecord, authMethod, meta)
+│
+├─ ① 生成 auth token                       ← 最先做，失败直接 500
+│     authRecord.NewAuthToken()
+│
+└─ recordAuthResponse(e, authRecord, token, authMethod, meta)
+      │
+      ├─ ② 超级用户 IP 白名单校验          ← 仅 _superusers 集合生效
+      │     authRecord.IsSuperuser() + isIPInList(Settings.SuperuserIPs)
+      │
+      ├─ ③ AuthRule 校验                   ← CanAccessRecord(AuthRule)
+      │     nil → 全禁 / "" → 全通 / 表达式 → SQL 过滤
+      │
+      ├─ ④ OnRecordAuthRequest 事件        ← 构造 RecordAuthRequestEvent
+      │     注入 token/record/authMethod/meta，开发者可介入
+      │     │
+      │     └─ 钩子回调内（如果 e.Written() 则提前返回）：
+      │          │
+      │          ├─ ⑤ MFA 检查
+      │          │     checkMFA() → 需要二次认证则写入 401 + mfaId 并返回
+      │          │
+      │          ├─ ⑥ 响应富化
+      │          │     triggerRecordEnrichHooks
+      │          │       • 超级用户：Unhide 所有字段
+      │          │       • IgnoreEmailVisibility(true)
+      │          │       • 根据 ?expand= 参数展开关联记录
+      │          │
+      │          ├─ ⑦ 登录告警 AuthAlert
+      │          │     authAlert() → 新设备 IP+UA 指纹首次登录时发邮件
+      │          │
+      │          └─ ⑧ 最终响应 JSON
+      │                {token, record, meta}  → HTTP 200
+      │
+      └── (钩子外层结束)
+```
+
+---
+
+### 6.2 步骤详解
+
+#### ① 先生成 Token（最早执行，失败直接 500）
 
 ```go
-token, tokenErr := authRecord.NewAuthToken()
+func RecordAuthResponse(e *core.RequestEvent, authRecord *core.Record, authMethod string, meta any) error {
+    token, tokenErr := authRecord.NewAuthToken()
+    if tokenErr != nil {
+        return e.InternalServerError("Failed to create auth token.", tokenErr)
+    }
+    return recordAuthResponse(e, authRecord, token, authMethod, meta)
+}
 ```
+
+**代码位置**：`apis/record_helpers.go` 第 36-43 行
+
+> ⚠️ **注意顺序**：Token 生成是**所有后续校验的前置步骤**——即便后续 IP 白名单或 AuthRule 校验失败导致用户无法登录，token 也已经生成。这是因为 OnRecordAuthRequest 钩子需要在事件数据中携带完整 token，开发者可能在钩子中自定义分发逻辑。
 
 `NewAuthToken` 定义于 `core/record_tokens.go` 第 47-49 行，最终调用 `newAuthToken`：
 
@@ -481,7 +560,211 @@ func NewJWT(payload jwt.MapClaims, signingKey string, duration time.Duration) (s
 
 ---
 
-### 6.2 Token 验证过程（校验端）
+#### ② 超级用户 IP 白名单校验
+
+```go
+if authRecord.IsSuperuser() {
+    allowedIPs := e.App.Settings().SuperuserIPs
+    if len(allowedIPs) > 0 && !isIPInList(allowedIPs, e.RealIP()) {
+        return e.ForbiddenError("", errors.New("superuser IP is not whitelisted"))
+    }
+}
+```
+
+**代码位置**：`apis/record_helpers.go` 第 46-51 行
+
+**规则说明**：
+- 仅对 `_superusers` 集合生效（`authRecord.IsSuperuser()` 为 true）
+- 读取全局配置 `Settings.SuperuserIPs`（IP 字符串数组）
+- **白名单为空 = 不做限制**，所有 IP 均可登录
+- **白名单非空 = 严格匹配**，请求真实 IP（`e.RealIP()`，考虑 TrustedProxy 头）必须在列表中，否则返回 403
+- 该检查早于 AuthRule，确保超级用户即使满足 AuthRule 也不能从非授权 IP 登录
+
+---
+
+#### ③ AuthRule 校验
+
+```go
+originalRequestInfo, err := e.RequestInfo()
+// ...
+ok, err := e.App.CanAccessRecord(authRecord, originalRequestInfo, authRecord.Collection().AuthRule)
+if !ok {
+    return firstApiError(err, e.ForbiddenError("The request doesn't satisfy the collection requirements to authenticate.", err))
+}
+```
+
+**代码位置**：`apis/record_helpers.go` 第 53-61 行
+
+`CanAccessRecord` 的实现位于 `core/record_query.go` 第 599-639 行：
+
+```go
+func (app *BaseApp) CanAccessRecord(record *Record, requestInfo *RequestInfo, accessRule *string) (bool, error) {
+    // 超级用户在 requestInfo 层面直接放行（但此处在 recordAuthResponse 中已经单独做了 IP 白名单）
+    if requestInfo.HasSuperuserAuth() {
+        return true, nil
+    }
+    // AuthRule = nil → 禁止任何人认证（仅超级用户可登录）
+    if accessRule == nil {
+        return false, nil
+    }
+    // AuthRule = "" → 空规则，任何人都可通过
+    if *accessRule == "" {
+        return true, nil
+    }
+    // AuthRule = "verified = true" 等表达式 → 走 SQL 过滤校验
+    query := app.RecordQuery(record.Collection()).
+        Select("(1)").
+        AndWhere(dbx.HashExp{record.Collection().Name + ".id": record.Id})
+    resolver := NewRecordFieldResolver(app, record.Collection(), requestInfo, true)
+    expr, err := search.FilterData(*accessRule).BuildExpr(resolver)
+    // ... 执行查询，存在记录即通过
+    return exists > 0, nil
+}
+```
+
+**AuthRule 的三种配置语义**（定义于 `core/collection_model_auth_options.go` 第 98-108 行）：
+
+| AuthRule 值 | 含义 |
+|-------------|------|
+| `nil` | 彻底关闭该集合的认证（password/OAuth2/OTP 全部失效，仅超级用户可通过后台操作） |
+| `""`（空字符串） | 不设额外限制，任何该集合用户只要通过凭证校验即可登录 |
+| `"verified = true"` 等表达式 | 必须满足过滤规则才能登录（典型用例：只允许已验证邮箱的用户认证） |
+
+> 💡 **注意**：这里传入的 `originalRequestInfo` 是**认证前**的请求上下文（`requestInfo.Auth` 仍为空或为旧登录态），确保 AuthRule 不会被当前正登录的用户身份 "self-fulfilling"。
+
+---
+
+#### ④ OnRecordAuthRequest 事件钩子
+
+```go
+event := new(core.RecordAuthRequestEvent)
+event.RequestEvent = e
+event.Collection = authRecord.Collection()
+event.Record = authRecord
+event.Token = token
+event.Meta = meta
+event.AuthMethod = authMethod
+
+return e.App.OnRecordAuthRequest().Trigger(event, func(e *core.RecordAuthRequestEvent) error {
+    // ... ⑤⑥⑦⑧ 在钩子回调内执行
+})
+```
+
+**代码位置**：`apis/record_helpers.go` 第 63-71 行
+
+**事件数据结构**：`core/events.go` 中的 `RecordAuthRequestEvent`
+
+| 字段 | 说明 |
+|------|------|
+| `Token` | 步骤①已生成的 JWT（开发者可替换） |
+| `Record` | 当前认证用户（开发者可修改字段） |
+| `AuthMethod` | 对于 OAuth2 固定为 `"oauth2"` |
+| `Meta` | OAuth2 场景下为 `{OAuth2User, IsNewRecord}` |
+
+开发者可以在此钩子中：
+- 修改 `e.Token` 替换为自定义 token 格式
+- 修改 `e.Written()` 提前返回自定义响应（跳过后续 MFA/富化等步骤）
+- 记录审计日志、注入额外响应头等
+
+---
+
+#### ⑤ MFA 检查（在钩子回调内）
+
+```go
+mfaId, err := checkMFA(e.RequestEvent, e.Record, e.AuthMethod)
+// require additional authentication
+if mfaId != "" {
+    e.JSON(http.StatusUnauthorized, map[string]string{
+        "mfaId": mfaId,
+    })
+    return ErrMFA
+}
+```
+
+**代码位置**：`apis/record_helpers.go` 第 76-92 行
+
+- 若集合未启用 MFA 或 `authMethod` 为空，直接跳过
+- `wantsMFA()` 根据 `collection.MFA.Rule` 表达式判断当前用户是否需要 MFA
+- 需要 MFA 时：创建 MFA record，返回 401 + `{"mfaId": "..."}`，由前端完成二次认证后再次调用
+
+---
+
+#### ⑥ 响应富化（在钩子回调内）
+
+```go
+// 创建浅拷贝，将当前登录用户挂载到 Auth 上下文中
+requestInfo := *originalRequestInfo
+requestInfo.Auth = e.Record
+
+err = triggerRecordEnrichHooks(e.App, &requestInfo, []*core.Record{e.Record}, func() error {
+    if e.Record.IsSuperuser() {
+        e.Record.Unhide(e.Record.Collection().Fields.FieldNames()...)  // 超级用户：所有字段可见
+    }
+    e.Record.IgnoreEmailVisibility(true)                              // 总是暴露当前用户邮箱
+    // expand 关联记录
+    expands := strings.Split(e.Request.URL.Query().Get(expandQueryParam), ",")
+    if len(expands) > 0 {
+        e.App.ExpandRecord(e.Record, expands, expandFetch(e.App, &requestInfo))
+    }
+    return nil
+})
+```
+
+**代码位置**：`apis/record_helpers.go` 第 94-119 行
+
+> 关键设计：富化时使用**认证后**的 `requestInfo.Auth = e.Record`，这样 expand 子查询中可以正确解析 `@request.auth.*` 表达式。
+
+---
+
+#### ⑦ 登录告警 AuthAlert（在钩子回调内）
+
+```go
+if e.AuthMethod != "" && authRecord.Collection().AuthAlert.Enabled {
+    if err = authAlert(e.RequestEvent, e.Record); err != nil {
+        e.App.Logger().Warn("[recordAuthResponse] Failed to send login alert", "error", err)
+    }
+}
+```
+
+**代码位置**：`apis/record_helpers.go` 第 121-125 行
+
+- 对 `authMethod` 为空的场景（如 refresh token）不发告警
+- 根据 IP + UserAgent 计算 MD5 指纹
+- 新指纹首次登录时异步发送告警邮件
+- 维护最近 5 个登录来源记录（LRU 淘汰）
+
+---
+
+#### ⑧ 最终响应 JSON（在钩子回调内）
+
+```go
+result := struct {
+    Meta   any          `json:"meta,omitempty"`
+    Record *core.Record `json:"record"`
+    Token  string       `json:"token"`
+}{
+    Token:  e.Token,
+    Record: e.Record,
+}
+if e.Meta != nil {
+    result.Meta = e.Meta
+}
+
+return execAfterSuccessTx(true, e.App, func() error {
+    return e.JSON(http.StatusOK, result)
+})
+```
+
+**代码位置**：`apis/record_helpers.go` 第 127-142 行
+
+- OAuth2 场景下 `meta` 包含 `OAuth2User`（第三方用户信息）和 `IsNewRecord`（是否新注册用户）
+- 通过 `execAfterSuccessTx` 确保响应只在数据库事务成功提交后才写入
+
+> 💡 PocketBase **不使用服务端 session 和 cookie**。会话完全由前端保存 JWT token，每次请求通过 `Authorization` 头携带。
+
+---
+
+### 6.3 Token 验证过程（校验端）
 
 后续每个请求到达时，由 `apis/middlewares.go` 中的 `loadAuthToken` 中间件处理：
 
@@ -519,76 +802,52 @@ func ParseJWT(token string, verificationKey string) (jwt.MapClaims, error) {
 
 ---
 
-### 6.3 通用 Auth 响应处理
-
-通过所有校验后，`apis/record_helpers.go` 中的 `recordAuthResponse` 执行以下步骤：
-
-1. **MFA 检查**（`apis/record_helpers.go` 中的 `checkMFA`）：
-   - 若集合启用了 MFA 且符合 MFA Rule，则要求二次认证
-   - 首次调用：创建 MFA record，返回 `mfaId`，HTTP 401
-   - 二次调用：验证 mfaId 和不同的 authMethod
-
-2. **Record 数据富化**：
-   - 对超级用户：取消所有隐藏字段
-   - 暴露当前认证用户的邮箱（`IgnoreEmailVisibility(true)`）
-   - 根据 `?expand=` 参数展开关联记录
-
-3. **登录告警（Auth Alert）**：若集合配置了 `AuthAlert.Enabled`：
-   - 生成 IP + UserAgent 的 MD5 指纹
-   - 新指纹首次登录时发送邮件告警
-   - 维护最近 5 个登录来源
-
-4. **最终响应**：
-   ```json
-   {
-       "token":  "eyJhbGciOiJIUzI1NiIs...",
-       "record": { /* 用户 record */ },
-       "meta":   { /* OAuth2 user info + isNew flag */ }
-   }
-   ```
-
-> 💡 PocketBase **不使用服务端 session 和 cookie**。会话完全由前端保存 JWT token，每次请求通过 `Authorization` 头携带。
-
----
-
 ## 七、auth-with-oauth2 → 会话返回的完整门禁时序
 
 ```
 POST /collections/{collection}/auth-with-oauth2
           │
           ▼
-    ┌───────────────────────────┐
-    │ 门禁 1: 集合级校验        │
-    │  • auth 集合?             │
-    │  • OAuth2 已启用?         │
-    └─────────────┬─────────────┘
+    ┌───────────────────────────────┐
+    │ 门禁 1: 集合级校验            │
+    │  • auth 集合?                 │
+    │  • OAuth2 已启用?             │
+    │  • fallbackAuthRecord 提取    │
+    └─────────────┬─────────────────┘
                   ▼
-    ┌───────────────────────────┐
-    │ 门禁 2: 表单校验           │
-    │  • provider 必填+有效      │
-    │  • code 必填               │
-    │  • redirectURL 必填(仅非空)│
-    └─────────────┬─────────────┘
+    ┌───────────────────────────────┐
+    │ 门禁 2: 表单校验+兼容处理      │
+    │  • BindBody 解析              │
+    │  • redirectUrl→redirectURL    │
+    │    (旧有值且新为空时迁移+Warn) │
+    │  • validate()                 │
+    │    - provider 必填+有效        │
+    │    - code 必填                │
+    │    - redirectURL 必填(仅非空) │
+    └─────────────┬─────────────────┘
                   ▼
-    ┌───────────────────────────┐
-    │ 门禁 3: Provider 交互      │
-    │  • 初始化 provider         │
-    │  • FetchToken(code)        │
-    │  • FetchAuthUser(token)    │
-    └─────────────┬─────────────┘
+    ┌───────────────────────────────┐
+    │ 门禁 3: Provider 交互         │
+    │  • InitProvider (ClientId/Secret/URLs) │
+    │  • SetRedirectURL + SetContext(30s)    │
+    │  • PKCE 时附加 code_verifier            │
+    │  • FetchToken(code) → access_token     │
+    │  • FetchAuthUser(token) → AuthUser      │
+    └─────────────┬─────────────────┘
                   ▼
-    ┌───────────────────────────┐
-    │ 账号定位(三级匹配)         │
-    │  1. ExternalAuth 精确查找  │
-    │  2. 已登录 fallback        │
-    │  3. 邮箱模糊匹配           │
-    └─────────────┬─────────────┘
+    ┌───────────────────────────────┐
+    │ 账号定位(三级匹配)             │
+    │  1. ExternalAuth 精确查找      │
+    │  2. 已登录 fallback            │
+    │  3. 邮箱模糊匹配               │
+    └─────────────┬─────────────────┘
                   ▼
-    ┌───────────────────────────┐
-    │ 门禁 6: 事件钩子           │
-    │ OnRecordAuthWithOAuth2-    │
-    │ Request                    │
-    └─────────────┬─────────────┘
+    ┌───────────────────────────────┐
+    │ 门禁 6: 事件钩子               │
+    │ OnRecordAuthWithOAuth2Request │
+    │ (可修改 Record/CreateData/    │
+    │  返回 error 中止)             │
+    └─────────────┬─────────────────┘
                   ▼
     ┌─────────────────────────────────────┐
     │ oauth2Submit (DB 事务)              │
@@ -609,35 +868,34 @@ POST /collections/{collection}/auth-with-oauth2
     │  └─ 创建 ExternalAuth 关联记录       │
     └─────────────┬───────────────────────┘
                   ▼
-    ┌───────────────────────────┐
-    │ 门禁 7: AuthRule 校验     │
-    │ CanAccessRecord(rule)     │
-    │ • nil   → 禁止            │
-    │ • ""    → 放行            │
-    │ • 表达式 → SQL 过滤       │
-    └─────────────┬─────────────┘
-                  ▼
-    ┌───────────────────────────┐
-    │ Token 签发                │
-    │  key = tokenKey + secret  │
-    │  HS256 (type,id,collId,   │
-    │         refreshable,exp)  │
-    └─────────────┬─────────────┘
-                  ▼
-    ┌───────────────────────────┐
-    │ 最终响应                   │
-    │  • MFA 检查               │
-    │  • Record 富化+expand     │
-    │  • 登录告警邮件           │
-    │  • {token, record, meta}  │
-    └───────────────────────────┘
+    ┌────────────────────────────────────────────────┐
+    │ RecordAuthResponse —— 统一会话出口             │
+    │  (所有认证方式共用此路径)                       │
+    │                                                  │
+    │  ① 先生成 Token (NewAuthToken → HS256)         │
+    │     ↓ 失败直接 500                               │
+    │  ② 超级用户 IP 白名单 (SuperuserIPs + RealIP)   │
+    │     ↓ 不在白名单 → 403                           │
+    │  ③ AuthRule 校验 (CanAccessRecord)              │
+    │     ↓ nil→全禁/""→全通/表达式→SQL 过滤          │
+    │  ④ OnRecordAuthRequest 事件                     │
+    │     └─ 钩子回调内 (Written() 可提前返回)        │
+    │          ⑤ MFA 检查                             │
+    │             ↓ 需要二次认证 → 401 + mfaId         │
+    │          ⑥ 响应富化                              │
+    │             • 超级用户: Unhide 所有字段          │
+    │             • IgnoreEmailVisibility(true)        │
+    │             • ?expand= 展开关联记录              │
+    │          ⑦ 登录告警 AuthAlert (IP+UA 指纹)       │
+    │          ⑧ 响应 JSON {token, record, meta}       │
+    └────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 八、后续请求中的认证中间件
 
-每次请求由 `apis/middlewares.go` 中的 `loadAuthToken` 中间件处理，核心逻辑见 6.2 节。
+每次请求由 `apis/middlewares.go` 中的 `loadAuthToken` 中间件处理，核心逻辑见 6.3 节。
 
 ---
 
@@ -648,9 +906,11 @@ POST /collections/{collection}/auth-with-oauth2
 | **PKCE** | `apis/record_auth_methods.go` 第 156-164 行 | 支持 S256 模式，防止授权码被截获 |
 | **State + Realtime 绑定** | `apis/record_auth_with_oauth2_redirect.go` 第 46-66 行 | state 作为 Realtime clientId，附加 IP 校验防 XSRF |
 | **超级用户禁 OAuth2 注册** | `apis/record_auth_with_oauth2.go` 第 264-266 行 | 禁止 `_superusers` 集合通过 OAuth2 自动产生账号 |
+| **超级用户 IP 白名单** | `apis/record_helpers.go` 第 46-51 行 | `Settings.SuperuserIPs` 非空时严格限制登录来源 IP |
 | **AuthRule 三道门** | `core/record_query.go` 第 599-639 行 | nil 全禁 / "" 全通 / 表达式过滤 |
 | **防预注册劫持** | `apis/record_auth_with_oauth2.go` 第 344-363 行 | 未验证账号自动重置密码、清除旧 OAuth2 关联 |
 | **验证升级清理** | `core/external_auth_model.go` 第 141-177 行 | 从未验证→已验证时清除所有 ExternalAuth 并刷新 tokenKey |
 | **安全下载头像** | `apis/record_auth_with_oauth2.go` 第 438-511 行 | `safeHTTPClient` 禁止访问内网/回环 IP，防止 SSRF |
 | **每用户独立 tokenKey** | `core/record_tokens.go` 第 56 行 | 密码修改或验证升级时使所有旧 token 失效 |
 | **JWT 算法锁定** | `tools/security/jwt.go` 第 29 行 | `jwt.WithValidMethods([]string{"HS256"})` 防止 alg=none 攻击 |
+| **token 生成先于校验** | `apis/record_helpers.go` 第 37 行 | 保证 OnRecordAuthRequest 钩子能拿到完整 token，支持自定义分发逻辑 |
