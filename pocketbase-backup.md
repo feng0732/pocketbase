@@ -313,16 +313,22 @@ if ok, _ := fsys.Exists(name); !ok {
 │  │   └─ 后果：pb_data 完整如初，replaceErr 被返回                       │
 │  │                                                                     │
 │  ├─ Step A 成功，Step B 失败（MoveDirContent extracted → pb_data）      │
-│  │   ├─ MoveDirContent 内部 tryRollback() 只回滚 Step B 已搬走的条目     │
+│  │   ├─ Step B 的 MoveDirContent 内部 tryRollback() 将已迁入的条目      │
+│  │   │  全部 Rename 回 extractedDataDir                                  │
 │  │   ├─ ⚠️ Step A 的结果 **不会被自动回滚**                              │
-│  │   ├─ 此时磁盘状态：                                                  │
-│  │   │   ├── pb_data/  = 排除列表中的条目 + Step B 部分成功的备份数据    │
+│  │   ├─ tryRollback 全部成功时磁盘状态：                                 │
+│  │   │   ├── pb_data/  = 仅剩排除列表中的条目（无 data.db，是空壳）     │
 │  │   │   ├── oldTempDataDir/  = Step A 搬走的原 pb_data 完整数据        │
-│  │   │   └── extractedDataDir/  = Step B 回滚后还原的剩余备份数据       │
+│  │   │   └── extractedDataDir/  = tryRollback 退回的完整备份数据        │
+│  │   ├─ tryRollback 部分失败时磁盘状态：                                 │
+│  │   │   ├── pb_data/  = 排除列表中的条目 + 未能退回的残余备份数据      │
+│  │   │   ├── oldTempDataDir/  = Step A 搬走的原 pb_data 完整数据        │
+│  │   │   └── extractedDataDir/  = 已退回的备份数据 + 仍在此的备份数据   │
 │  │   ├─ replaceErr 被直接 return                                        │
 │  │   ├─ extractedDataDir 通过 defer 删除                                │
 │  │   ├─ ⚠️ oldTempDataDir **没有 defer 删除**                           │
-│  │   └─ 后果：pb_data 处于中间不一致状态！                               │
+│  │   └─ 后果：pb_data 处于不一致状态！                                   │
+│  │        无论 tryRollback 是否完全成功，pb_data 都缺少有效的 data.db   │
 │  │        原数据完整躺在 .pb_temp_to_delete/old_pb_data_* 中            │
 │  │        需要手动恢复，或下次启动会被误删（.pb_temp_to_delete 整体清空） │
 │  │                                                                     │
@@ -346,6 +352,8 @@ if ok, _ := fsys.Exists(name); !ok {
 
 **关键结论：**
 - Step A 成功 + Step B 失败这个场景是**危险窗口**：原数据已搬出 pb_data，但没有触发全局回滚
+- Step B 的 `tryRollback()` 会将已迁入 pb_data 的备份数据退回 extractedDataDir，所以 **pb_data 中不会保留部分备份数据**；但退回成功后 pb_data 只剩排除项，是一个没有 `data.db` 的空壳
+- 只有当 `tryRollback()` 自身也部分失败时，才会有残余备份数据留在 pb_data 中
 - 这个窗口的存在是因为 [core/base_backup.go#L270-L272](core/base_backup.go#L270-L272) 中 `replaceErr` 直接 return，没有走 `revertDataDirChanges` 逻辑
 - `oldTempDataDir` 没有独立的 `defer os.RemoveAll`（只有 `extractedDataDir` 在 [core/base_backup.go#L194-L195](core/base_backup.go#L194-L195) 有），依赖于上层 `LocalTempDirName` 目录在下次 Bootstrap 时整体删除（见 [core/base.go#L431](core/base.go#L431)）
 - 下次 Bootstrap 时 `os.RemoveAll(pb_data/.pb_temp_to_delete)` 会把原数据一并删除，如果 Step B 失败后未手动干预，原数据永久丢失
@@ -461,7 +469,8 @@ MoveDirContent(src, dest, rootExclude...)
 │                                                                      │
 │  第四步：execve 重启进程（成功路径）                                    │
 │     或 Restart 失败 → revertDataDirChanges() 完整回滚                  │
-│     或 Step B 中途失败 → 仅 Step B 局部回滚（⚠️ 原数据留在 old 目录）    │
+│     或 Step B 中途失败 → tryRollback 退回已迁入数据                     │
+│        ⚠️ pb_data 只剩排除项（无 data.db 空壳），原数据留在 old 目录     │
 │                                                                      │
 │  下次启动：os.RemoveAll(.pb_temp_to_delete) 清理全部临时数据            │
 │                                                                      │
