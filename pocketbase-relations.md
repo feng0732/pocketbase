@@ -289,9 +289,12 @@ if refCollection.Id == mainRecord.Collection().Id {
 
 **这是一个防御性过滤，设计意图有三层**：
 
-1. **不依赖事务隔离语义**：显式地表达"被删记录自身的自引用不纳入级联处理范围"的意图，不依赖具体数据库/隔离级别的行为。如果未来底层数据库变化（比如换了隔离级别更低的存储引擎），或者代码调整了 e.Next() 和查询的先后顺序，这个条件依然能保证正确性。
+1. **不依赖删除时序**：显式地表达"被删记录自身的自引用不纳入级联处理范围"的意图，不依赖 e.Next() 和查询之间的先后执行顺序。如果未来代码调整了删除和查询的顺序，这个条件依然能保证正确性。
 
-2. **递归删除场景的兜底保护**：`deleteRefRecords` 里触发级联时调用的是 `app.Delete(refRecord)`，会完整走一遍删除流程（包括嵌套事务）。虽然 SQLite savepoint 嵌套下内层也看不到外层已删记录，但显式排除自己给递归调用多加了一层保险，避免自引用环（A→B→A）在边界条件下重复处理同一条记录。
+2. **递归删除场景的兜底保护**：`deleteRefRecords` 里触发级联时调用的是 `app.Delete(refRecord)`，会完整走一遍删除流程。根据 [runInTransaction](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/db_tx.go#L25-L49) 的实现——如果当前 db 已经是 `*dbx.Tx`，嵌套的 `RunInTransaction` **不会另开 savepoint，而是直接复用当前事务执行回调**——这意味着：
+   - 所有级联删除、引用记录更新都在**同一个顶层事务**里执行
+   - 同事务内的写操作对后续查询是**立即可见**的（不会被隔离）
+   - 当自引用环（A→B→C→A）在同一事务内递归处理时，显式排除当前被删记录可以避免对同一条记录的重复扫描和处理
 
 3. **明确语义边界**：被删记录本身即将消失，它的字段值（包括自引用关系）已经没有任何维护价值。通过查询条件显式排除，可以避免对"一条即将消失的记录的关系字段"做任何无意义的读/写操作。
 
@@ -411,7 +414,46 @@ onRecordDeleteExecute
               └─ 所有引用集合处理完成 → return nil（提交事务）
 ```
 
-### 4.7 数据库表同步
+### 4.7 递归删除中的事务复用机制
+
+递归级联删除时事务的真实行为是理解整个流程的关键。看 [runInTransaction](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/db_tx.go#L25-L49) 的核心实现：
+
+```go
+func (app *BaseApp) runInTransaction(db dbx.Builder, fn func(txApp App) error, isForAuxDB bool) error {
+    switch txOrDB := db.(type) {
+    case *dbx.Tx:
+        // run as part of the already existing transaction
+        return fn(app)   // ← 已经在事务里了，直接执行回调，不开新事务也不开 savepoint
+    case *dbx.DB:
+        var txApp *BaseApp
+        txErr := txOrDB.Transactional(func(tx *dbx.Tx) error {  // ← 只有这里才开新事务
+            txApp = app.createTxApp(tx, isForAuxDB)
+            return fn(txApp)
+        })
+        // ... 处理 txApp.txInfo.runAfterFuncs
+        return txErr
+    }
+}
+```
+
+**行为总结**：
+
+| 调用场景 | db 实际类型 | 行为 |
+|----------|-------------|------|
+| 顶层 `onRecordDeleteExecute` 首次调用 | `*dbx.DB`（普通连接） | 开启真正的 SQLite 事务，创建 txApp（txInfo.parent 指向原 app） |
+| 级联触发 `app.Delete(refRecord)` 后，其内部的 `RunInTransaction` | `*dbx.Tx`（已经在事务里） | **直接执行回调，复用当前事务**——既不开新事务，也不用 SAVEPOINT |
+
+**对级联删除的实际影响**：
+
+1. **所有写操作共属一个事务**：主记录删除、所有级联的引用记录删除/更新都在同一个顶层事务里。任何一步报错，全部一起回滚。
+
+2. **写操作立即可见**：同一事务内的 DELETE/UPDATE 对后续的 SELECT 是立即可见的（没有事务隔离）。比如引用记录 A 删了之后，后续循环里的查询就查不到 A 了。
+
+3. **OnComplete 回调的触发时机**：`txInfo.OnComplete` 注册的回调（比如 `OnModelAfterDeleteSuccess`）不会在每层嵌套完成时触发，而是全部累积到**最外层事务提交/回滚后**才统一执行（由最外层的 `txApp.txInfo.runAfterFuncs` 一次性调用）。
+
+4. **为什么这样设计**：避免 savepoint 嵌套带来的性能开销和 SQLite 兼容性问题，同时保证级联操作的完整原子性。
+
+### 4.8 数据库表同步
 
 [collection_record_table_sync.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/collection_record_table_sync.go) 负责集合结构变更时的表同步：
 
@@ -476,6 +518,7 @@ return actionFunc()
 | [field.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/field.go) | 字段通用接口、拦截器接口、拦截器Action常量 |
 | [record_model.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/record_model.go) | Record模型、Hook桥接、级联删除(cascadeRecordDelete/deleteRefRecords) |
 | [db.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/db.go) | Save/Delete 核心流程、事务处理、事件触发 |
+| [db_tx.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/db_tx.go) | RunInTransaction 实现、嵌套事务复用逻辑、TxAppInfo 回调管理 |
 | [collection_query.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/collection_query.go) | FindCachedCollectionReferences 反向引用查找 |
 | [collection_record_table_sync.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/core/collection_record_table_sync.go) | 表结构同步、单选/多选切换的数据迁移 |
 | [forms/record_upsert.go](file:///d:/fz/0601/solo-dogfeeding/code/153-pocketbase/forms/record_upsert.go) | 记录创建/更新表单、数据加载与提交 |
