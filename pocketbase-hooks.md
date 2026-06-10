@@ -417,35 +417,48 @@ if app.txInfo != nil {
 
 ---
 
-## 六、Model 与 Record 的钩子代理关系
+## 六、Model 与 Record 的钩子代理关系（修正版）
 
-### 6.1 两层钩子体系
+### 6.1 之前流程图的错误点
 
-PocketBase 存在 **两层** 模型钩子：
+原文档的流程描述与源码不符，主要错误有：
+
+| 错误描述 | 事实 |
+|----------|------|
+| OnRecordValidate 是 OnRecordCreate 的一部分 | ❌ 两者是 **完全独立** 的两条钩子链，在不同层级分别触发 |
+| OnRecordCreateExecute 内部做实际的 DB INSERT | ❌ 真正的 DB INSERT 在 **Model 层** `OnModelCreateExecute` 的 oneOff 中 |
+| OnModelValidate 和 OnModelCreateExecute 是 OnModelCreate 之后独立触发的 | ❌ 两者都 **嵌套在** `OnModelCreate` 的 oneOff 处理函数内部，是独立的子链 |
+| Record 层钩子在 Model 层之前"整体执行完" | ❌ 遵循洋葱模型，Record 层和 Model 层的用户 Handler 是 **交错** 执行的 |
+
+### 6.2 两层钩子体系
+
+PocketBase 存在 **两层** 模型钩子，但 Record 层并非简单的"在 Model 层之前整体执行"：
 
 | 层级 | 钩子示例 | 适用范围 |
 |------|----------|----------|
-| 通用 Model 层 | `OnModelCreate`、`OnModelUpdate`... | 所有 Model（Record、Collection、Settings 等） |
-| 专用 Record 层 | `OnRecordCreate`、`OnRecordUpdate`... | 仅 Record 类型模型 |
+| 通用 Model 层 | `OnModelCreate`、`OnModelUpdate`、`OnModelValidate`... | 所有 Model（Record、Collection、Settings 等） |
+| 专用 Record 层 | `OnRecordCreate`、`OnRecordUpdate`、`OnRecordValidate`... | 仅 Record 类型模型 |
 
-### 6.2 代理桥接机制
+此外，**每一个** Model 层钩子都通过独立的系统桥接 Handler 对应到一个 Record 层钩子。
 
-Record 层钩子并非独立存在，而是通过 **系统内置 Handler** 桥接自 Model 层。参见 [record_model.go#L55-L288](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/record_model.go#L55-L288)。
+### 6.3 代理桥接机制的精确结构
 
-以 `OnModelCreate → OnRecordCreate` 为例：
+Record 层钩子并非独立存在，而是通过 **系统内置 Handler** 桥接自 Model 层。参见 [record_model.go#L55-L350](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/record_model.go#L55-L350)。
+
+所有 CRUD 相关的钩子对（5 个操作 × 每个操作 5 个阶段 = 25 对）都有相同的桥接模式。以 `OnModelCreate → OnRecordCreate` 为例：
 
 ```go
+// 系统桥接 Handler：注册在 Model 层，Priority=-99（最优先）
 app.OnModelCreate().Bind(&hook.Handler[*ModelEvent]{
-    Id:       "__pbRecordSystemHook__",
-    Priority: -99,  // 极低优先级 → 最早执行
+    Id:       systemHookIdRecord,
+    Priority: -99,
     Func: func(me *ModelEvent) error {
-        // 尝试转换为 RecordEvent
         if re, ok := newRecordEventFromModelEvent(me); ok {
             // 是 Record 类型 → 触发 Record 层钩子
             err := me.App.OnRecordCreate().Trigger(re, func(re *RecordEvent) error {
-                syncModelEventWithRecordEvent(me, re)
-                defer syncRecordEventWithModelEvent(re, me)
-                return me.Next()  // 继续 Model 层链条
+                syncModelEventWithRecordEvent(me, re)       // 进入前同步状态
+                defer syncRecordEventWithModelEvent(re, me) // 返回时回写状态
+                return me.Next()  // 关键：Record 链的 oneOff 就是回到 Model 层继续
             })
             syncModelEventWithRecordEvent(me, re)
             return err
@@ -456,36 +469,177 @@ app.OnModelCreate().Bind(&hook.Handler[*ModelEvent]{
 })
 ```
 
-### 6.3 完整触发顺序（以 Record 创建为例）
+**桥接的本质**：Record 层钩子链的 `oneOff` 处理函数就是 `me.Next()`，即回到 Model 层继续执行下一个 Handler。这样 Record 链和 Model 链被拼接成一个更大的洋葱。
+
+### 6.4 Record 层内部的系统 Handler
+
+除了 Model→Record 的桥接 Handler，Record 层钩子内部 **还注册了自己的系统 Handler**（ID 相同，都是 `__pbRecordSystemHook__`），负责调用字段拦截器或实际业务逻辑。不同阶段的 Priority 不同：
+
+| Record 层钩子 | 系统 Handler Priority | 职责 |
+|---------------|----------------------|------|
+| `OnRecordCreate` | **-99**（最优先） | 调用 `callFieldInterceptors(InterceptorActionCreate, e.Next)`，即字段的 Create 拦截器先于用户 Handler |
+| `OnRecordValidate` | **99**（最低优先级/最内层） | 先执行用户 Handler，最后调用 `onRecordValidate()` 做实际字段验证 |
+| `OnRecordCreateExecute` | **99**（最内层） | 先执行用户 Handler，最后调用 `onRecordSaveExecute()` 做 Auth Token 刷新、唯一性检查、DB 错误规范化 |
+| `OnRecordAfterCreateSuccess` | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+| `OnRecordAfterCreateError` | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+
+### 6.5 真实触发顺序（以 Record 创建为例，修正版）
+
+入口代码参见 [db.go#L273-L366](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L273-L366)：
+
+```go
+// 入口：app.Save(record) 最终调用 create()
+saveErr := app.OnModelCreate().Trigger(event, func(e *ModelEvent) error {
+    // ===== oneOff_ModelCreate：验证 + 执行 =====
+    if withValidations {
+        // ★ 第一条独立子链：OnModelValidate
+        validateErr := e.App.ValidateWithContext(e.Context, e.Model)
+        if validateErr != nil { return validateErr }
+    }
+    // ★ 第二条独立子链：OnModelCreateExecute
+    return e.App.OnModelCreateExecute().Trigger(event, func(e *ModelEvent) error {
+        // 实际 DB INSERT（最内层）
+        _, err = db.Insert(e.Model.TableName(), data).Execute()
+        e.Model.MarkAsNotNew()
+        return err
+    })
+})
+// ===== 后续：成功/失败处理 =====
+if saveErr != nil {
+    // ★ 第三条独立链：OnModelAfterCreateError
+    hookErr := app.OnModelAfterCreateError().Trigger(errEvent)
+} else if !inTx {
+    // ★ 第四条独立链：OnModelAfterCreateSuccess
+    err := event.App.OnModelAfterCreateSuccess().Trigger(event)
+}
+```
+
+下面是完整的执行展开图。假设用户注册了 3 个自定义 Handler：
+
+- `User_Model_Create`：注册在 `OnModelCreate`
+- `User_Record_Create`：注册在 `OnRecordCreate`
+- `User_Model_CreateExecute`：注册在 `OnModelCreateExecute`
+- `User_Record_CreateExecute`：注册在 `OnRecordCreateExecute`
+- `User_Model_Validate`：注册在 `OnModelValidate`
+- `User_Record_Validate`：注册在 `OnRecordValidate`
 
 ```
-App.Save(record)
-  │
-  └─> OnModelCreate.Trigger(...)
-        │
-        ├─ [系统桥接 Handler, Priority=-99]
-        │     │
-        │     └─> OnRecordCreate.Trigger(...)
-        │           │
-        │           ├─ OnRecordValidate.Trigger(...)  （如果启用验证）
-        │           │
-        │           ├─ OnRecordCreateExecute.Trigger(...)
-        │           │     └─> 实际的 DB INSERT
-        │           │
-        │           └─> me.Next() 回到 Model 层
-        │
-        ├─ OnModelValidate.Trigger(...)  （如果启用验证）
-        │
-        ├─ OnModelCreateExecute.Trigger(...)
-        │     └─> 实际的 DB INSERT
-        │
-        └─> 完成 → OnModelAfterCreateSuccess
-                    │
-                    └─ [系统桥接 Handler]
-                          └─> OnRecordAfterCreateSuccess
+① OnModelCreate.Trigger(event, oneOff_ModelCreate)
+│
+├─ 桥接 Handler [Priority=-99, __pbRecordSystemHook__]
+│     │  转换 ModelEvent → RecordEvent 成功
+│     │
+│     └─ ①-A OnRecordCreate.Trigger(re, oneOff_RecordCreate)
+│           │
+│           ├─ Record 系统 Handler [Priority=-99]
+│           │     callFieldInterceptors(InterceptorActionCreate, ...)
+│           │       └─> 字段 Create 拦截器执行
+│           │
+│           ├─ User_Record_Create [用户 Handler]
+│           │     ├─ e.Next() 之前
+│           │     ├─ e.Next() ──────────────────────┐
+│           │     └─ e.Next() 之后                   │
+│           │                                        │
+│           └─ oneOff_RecordCreate = me.Next() ◄────┘
+│                 │  回到 OnModelCreate 链继续
+│                 │
+│                 ├─ User_Model_Create [用户 Handler]
+│                 │     ├─ e.Next() 之前
+│                 │     ├─ e.Next() ────────────────┐
+│                 │     └─ e.Next() 之后              │
+│                 │                                   │
+│                 └─ oneOff_ModelCreate ◄─────────────┘
+│                       │
+│                       ├─ ② ValidateWithContext()
+│                       │     │
+│                       │     └─ ②-A OnModelValidate.Trigger(...)
+│                       │           │
+│                       │           ├─ 桥接 Handler [Priority=-99]
+│                       │           │     └─ OnRecordValidate.Trigger(...)
+│                       │           │           ├─ User_Record_Validate [用户]
+│                       │           │           └─ 系统 Handler [Priority=99]
+│                       │           │                 onRecordValidate() → 实际字段验证
+│                       │           │
+│                       │           ├─ User_Model_Validate [用户 Handler]
+│                       │           └─ oneOff → model.PostValidate()
+│                       │
+│                       └─ ③ OnModelCreateExecute.Trigger(event, oneOff_Execute)
+│                             │
+│                             ├─ 桥接 Handler [Priority=-99]
+│                             │     └─ ③-A OnRecordCreateExecute.Trigger(...)
+│                             │           │
+│                             │           ├─ User_Record_CreateExecute [用户]
+│                             │           └─ 系统 Handler [Priority=99]
+│                             │                 onRecordSaveExecute()
+│                             │                   ├─ Auth TokenKey 刷新
+│                             │                   ├─ Auth ID 跨集合校验
+│                             │                   ├─ e.Next() ──┐
+│                             │                   └─ 错误规范化    │
+│                             │                                  │
+│                             ├─ User_Model_CreateExecute [用户] │
+│                             │     ├─ e.Next() 之前              │
+│                             │     ├─ e.Next() ────────────────┤
+│                             │     └─ e.Next() 之后              │
+│                             │                                  │
+│                             └─ oneOff_Execute ◄────────────────┘
+│                                   └─ db.Insert() → ★ 真正的 DB INSERT
+│
+④ saveErr 判断
+   ├─ 失败 → OnModelAfterCreateError.Trigger(...)
+   │          └─ 桥接 Handler → OnRecordAfterCreateError.Trigger(...)
+   │                └─ Record 系统 Handler [Priority=-99] → 字段拦截器
+   │
+   └─ 成功 → OnModelAfterCreateSuccess.Trigger(...)
+              └─ 桥接 Handler → OnRecordAfterCreateSuccess.Trigger(...)
+                    └─ Record 系统 Handler [Priority=-99] → 字段拦截器
 ```
 
-**注意**：由于桥接 Handler 的 Priority=-99，它会 **最先执行**，因此 Record 层钩子总是运行在 Model 层用户自定义钩子 **之前**。
+### 6.6 桥接模式总览
+
+所有 CRUD 阶段的桥接关系如下（5 个阶段 × 5 种操作 = 25 条独立的钩子对）：
+
+| 阶段 | Model 层钩子 | Record 层钩子 | 桥接 Handler Priority | Record 内部系统 Handler Priority |
+|------|-------------|--------------|----------------------|-------------------------------|
+| **Validate** | `OnModelValidate` | `OnRecordValidate` | -99 | **99**（用户 Handler 之后做实际验证） |
+| **Main** | `OnModelCreate/Update/Delete` | `OnRecordCreate/Update/Delete` | -99 | **-99**（先做字段拦截器） |
+| **Execute** | `OnModelCreateExecute` 等 | `OnRecordCreateExecute` 等 | -99 | **99**（用户之后做 Auth 检查/级联删除） |
+| **AfterSuccess** | `OnModelAfter*Success` | `OnRecordAfter*Success` | -99 | **-99**（先做字段拦截器） |
+| **AfterError** | `OnModelAfter*Error` | `OnRecordAfter*Error` | -99 | **-99**（先做字段拦截器） |
+
+### 6.7 DB 写入到底在哪一层发生？
+
+这是最容易混淆的点。以创建为例：
+
+- `onRecordSaveExecute()`（Record 层系统 Handler，Priority=99）**不做 DB 写入**，它只做：
+  - Auth 记录的 TokenKey 刷新（密码/邮箱变更时）
+  - Auth ID 跨集合唯一性校验
+  - 调用 `e.Next()` 推进链条
+  - 收到 DB 错误后做 `NormalizeUniqueIndexError` 规范化
+
+- **真正的 SQL INSERT/UPDATE/DELETE 发生在 Model 层**，即 `OnModelCreateExecute`（及对应 Update/Delete）的 oneOff 最内层。参见 [db.go#L290-L328](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L290-L328)：
+  ```go
+  return e.App.OnModelCreateExecute().Trigger(event, func(e *ModelEvent) error {
+      _, err = db.Insert(e.Model.TableName(), data).WithContext(e.Context).Execute()
+      // ...
+      e.Model.MarkAsNotNew()
+      return nil
+  })
+  ```
+
+这是因为 Model 层是通用的（支持 Record、Collection、Settings 等所有 Model），DB 写入逻辑不需要区分 Record 还是其他 Model。
+
+### 6.8 关键理解：四条独立钩子链
+
+一次 `app.Save(record)` 实际上会触发 **四条独立的钩子链**（每条都有自己的 Model→Record 桥接）：
+
+| 顺序 | 钩子链 | 触发条件 |
+|------|--------|---------|
+| 1 | `OnModelCreate`（嵌套 Validate + Execute 子链） | 总是触发 |
+| 2 | `OnModelValidate` | withValidations=true 时，在 OnModelCreate 的 oneOff 内触发 |
+| 3 | `OnModelCreateExecute` | 在 OnModelCreate 的 oneOff 内、验证通过后触发 |
+| 4 | `OnModelAfterCreateSuccess` / `OnModelAfterCreateError` | 根据 Execute 结果触发其一，事务中则延迟到 commit 后 |
+
+每条链都是独立的 `Trigger()` 调用，互不影响（当然，前面的链返回 error 会阻止后续链的触发）。
 
 ---
 
@@ -588,4 +742,6 @@ routeHook.Trigger(event, v.Action)
 | 标签过滤 | TaggedHook 包装 Func，不匹配时跳过 | [tagged.go#L58-L69](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/tagged.go#L58-L69) |
 | 错误传播 | Next 前返回 error 中断前进方向；Next 后返回 error 仅沿返回方向冒泡；外层可捕获 `e.Next()` 返回值决定透传/吞掉/包装 | [event.go#L30-L35](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/event.go#L30-L35)、[hook_test.go#L32](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/tools/hook/hook_test.go#L32) |
 | 事务延迟 | `txInfo.OnComplete` 回调中触发 After 钩子 | [db.go#L152-L167](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L152-L167) |
-| Model↔Record 桥接 | Priority=-99 的系统 Handler 做类型转换转发 | [record_model.go#L55-L288](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/record_model.go#L55-L288) |
+| Model↔Record 桥接 | 每个阶段独立注册 Priority=-99 的系统 Handler，Record 链的 oneOff 就是 `me.Next()` 回到 Model 链；Record 层内部还有自己的系统 Handler（Priority=-99 或 99，取决于阶段） | [record_model.go#L55-L350](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/record_model.go#L55-L350)、[db.go#L273-L366](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L273-L366) |
+| DB 写入层 | 实际 SQL INSERT/UPDATE/DELETE 在 **Model 层** `OnModel*Execute` 的 oneOff 中执行；Record 层的 Execute Handler 只做预处理和错误规范化 | [db.go#L290-L328](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L290-L328)、[record_model.go#L1429-L1474](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/record_model.go#L1429-L1474) |
+| 独立钩子链数量 | 一次 Save 会触发 4 条独立 Trigger 调用：Main → Validate → Execute → AfterSuccess/AfterError | [db.go#L280-L363](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/db.go#L280-L363) |
