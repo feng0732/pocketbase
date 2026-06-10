@@ -124,8 +124,8 @@ tools/archive/create.go: Create(srcDir, destZipPath, exclude...)
         └─ zipAddFS(os.DirFS(src), exclude...)
                 │
                 └─ fs.WalkDir 遍历源目录
-                        ├─ 跳过目录（不添加空目录条目）
-                        ├─ 检查排除路径（精确匹配或前缀匹配）
+                        ├─ 所有目录直接跳过（不添加目录条目到 zip）
+                        ├─ 对文件检查排除路径（精确匹配或前缀匹配）
                         ├─ zip.FileInfoHeader() + Deflate 方法
                         └─ io.Copy 将文件内容写入 zip
 ```
@@ -133,11 +133,14 @@ tools/archive/create.go: Create(srcDir, destZipPath, exclude...)
 **关键边界点：**
 
 **边界 1：排除路径匹配逻辑**
-- 位置：[tools/archive/create.go#L56-L61](tools/archive/create.go#L56-L61)
-- 两种匹配方式：
+- 位置：[tools/archive/create.go#L51-L61](tools/archive/create.go#L51-L61)
+- 执行顺序：
+  1. **先跳过所有目录**：`if d.IsDir() { return nil }` — zip 中不保存空目录条目
+  2. **再对文件做排除检查**：只处理普通文件
+- 两种匹配方式（对文件路径）：
   1. 精确匹配：`ignore == name`
   2. 目录前缀匹配：`clean(name) + "/"` 以 `clean(ignore) + "/"` 开头
-- 注意：只在遍历路径上排除，不会递归进入被排除的子目录（WalkDir 本身的行为）
+- **注意**：`fs.WalkDir` 会完整遍历整个目录树（包括被排除目录下的所有子目录），排除逻辑是在回调函数中对遍历到的每个文件进行路径匹配后 `return nil` 跳过，而非跳过目录遍历本身
 
 **边界 2：压缩级别**
 - 位置：[tools/archive/create.go#L31-L33](tools/archive/create.go#L31-L33)
@@ -188,7 +191,7 @@ HTTP POST /api/backups/{key}/restore
         ▼
 apis/backup.go: backupRestore()
         │  ├─ 并发检查
-        │  ├─ 校验备份文件存在（fsys.Exists 的错误被忽略）
+        │  ├─ 校验备份文件存在（API 层：!exists 时返回错误，err 附加到响应；exists 时忽略 err）
         │  └─ routine.FireAndForget — 异步执行（先返回 204 No Content）
         │        └─ time.Sleep(1s) — 等待 HTTP 响应写出后再开始实际恢复
         ▼
@@ -197,7 +200,7 @@ core/base_backup.go: RestoreBackup()
         │  ├─ 平台检查：Windows 不支持
         │  ├─ 创建临时目录 pb_data/.pb_temp_to_delete
         │  ├─ 获取备份文件系统
-        │  │
+        │  ├─ 再次校验存在性（核心层：ok, _ := fsys.Exists(name)，err 被显式忽略）
         │  ├─ [分支 A] S3 存储：
         │  │     ├─ fsys.GetReader() 获取 blob 流
         │  │     ├─ os.CreateTemp 创建临时 zip
@@ -237,13 +240,34 @@ core/base.go: Restart()
 - S3：先下载 blob 到临时 zip 文件，再解压（blob.Reader 不实现 `ReaderAt`，而 `zip.OpenReader` 需要随机访问）
 - 本地：直接读取 `pb_data/backups/` 下的 zip 文件路径传给 `archive.Extract`，避免额外磁盘拷贝
 
-**边界 3：恢复前完整性校验**
+**边界 3：恢复前备份存在性校验（两层差异）**
+
+**API 层**：[apis/backup.go#L142-L144](apis/backup.go#L142-L144)
+```go
+if exists, err := fsys.Exists(key); !exists {
+    return e.BadRequestError("Missing or invalid backup file.", err)
+}
+```
+- `err` 没有被忽略，当 `!exists` 时 `err` 作为内部错误附加到响应中
+- 当 `exists == true` 时，**即使 `err != nil`** 也会继续执行（不检查错误）
+- 30 秒超时上下文
+
+**核心层**：[core/base_backup.go#L190-L192](core/base_backup.go#L190-L192)
+```go
+if ok, _ := fsys.Exists(name); !ok {
+    return fmt.Errorf("missing or invalid backup file %q to restore", name)
+}
+```
+- `err` 用 `_` 显式完全忽略，只检查 `!ok`
+- 即使 `fsys.Exists` 返回底层错误（如 S3 连接失败），只要 `ok == true` 就继续
+- 继承调用方传入的 10 分钟超时上下文
+
+**边界 4：解压后完整性校验**
 - 位置：[core/base_backup.go#L245-L249](core/base_backup.go#L245-L249)
 - 解压后必须存在 `data.db` 文件，否则视为无效备份直接返回错误
 - 此时 `pb_data` 尚未被触碰，无任何副作用
-- 注意：API 层 `backupRestore()` 中 `fsys.Exists(name)` 的错误被用 `_` 忽略（见 [apis/backup.go#L142](apis/backup.go#L142)）
 
-**边界 4：原子替换（核心）**
+**边界 5：原子替换（核心）**
 - 位置：[core/base_backup.go#L253-L272](core/base_backup.go#L253-L272)
 - 使用 `osutils.MoveDirContent` 进行两步原子移动：
   - **Step A**：将当前 `pb_data` 内容（排除列表）移到 `oldTempDataDir`
@@ -251,9 +275,9 @@ core/base.go: Restart()
 - 整个过程包裹在两层 Transaction 中，阻塞数据库写入
 - **注意：RestoreBackup 中不执行 WAL checkpoint**（与 CreateBackup 不同）
 
-**边界 5：失败回滚机制（见下方 §4.3 详细分析）**
+**边界 6：失败回滚机制（见下方 §4.3 详细分析）**
 
-**边界 6：恢复时的排除列表**
+**边界 7：恢复时的排除列表**
 - 位置：[core/base_backup.go#L168](core/base_backup.go#L168)
 - 比备份时少排除 `.notify`：
   - `backups` — 保留现有备份不被覆盖
