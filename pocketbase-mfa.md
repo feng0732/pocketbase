@@ -247,8 +247,8 @@ checkMFA 执行步骤：
 
 | 流程阶段 | 影响 |
 |----------|------|
-| **启用** | MFA.Rule 表达式写错（比如字段名打错）时，集合保存阶段**不会报错**——因为 `validate` 只检查规则语法是否合法（`cv.checkRule`），不模拟执行。只有到真实用户登录时才爆雷。 |
-| **校验** | 规则一旦在运行时解析/执行失败，**所有需要走 MFA 的登录都会被 400 拒绝**。即使是已完成第一步、带着合法 `mfaId` 来做第二步认证的用户也会被挡在外面。 |
+| **启用（保存阶段）** | `checkRule` 只做语法/格式校验。括号不匹配、非法运算符、字段名不符合白名单正则（如写了 `@invalid.field`）会在保存时被拦；但 `@collection.xxx` 引用的集合不存在、字段类型与比较值不匹配等**运行时问题保存时放行**。详见 §4.5。 |
+| **校验（认证阶段）** | 规则一旦在运行时解析/执行失败，**所有需要走 MFA 的登录都会被 400 拒绝**。即使是已完成第一步、带着合法 `mfaId` 来做第二步认证的用户也会被挡在外面。 |
 | **失败处理** | 失败是"硬拒绝"而非"降级放行"。不会跳过 MFA 直接发 token，也不会创建新的 MFA 会话。客户端拿到的是和普通认证失败一样的 `Failed to authenticate.`，无法区分是密码错还是规则崩了。 |
 
 > 安全设计意图：规则执行失败属于"状态不确定"，宁可错杀（拒绝所有认证）也不放过（跳过 MFA），防止规则被攻击者绕过。
@@ -262,6 +262,85 @@ func wantsMFA(e *RequestEvent, record *Record) (bool, error)
 - 空规则 → `(true, nil)`（所有用户强制 MFA）
 - 有规则时构造查询：`SELECT 1 FROM {collection} WHERE id=? AND ({rule})`
 - 规则解析/执行**出错时返回 `(true, err)`**（安全优先：失败则收紧）
+
+### 4.5 MFA 规则两阶段校验对比：保存 vs 认证
+
+MFA.Rule 的有效性分两个阶段校验，两阶段覆盖的问题**完全不重叠**，很多无效规则要到用户登录时才暴露。
+
+#### 阶段一：集合保存时的 `checkRule`
+入口：[collection_model_auth_options.go#L203-L219](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/core/collection_model_auth_options.go#L203-L219) → 调用 [collection_validate.go#L477-L503](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/core/collection_validate.go#L477-L503) 的 `checkRule`
+
+**触发条件**：`MFA.Enabled = true` **且** `MFA.Rule != ""`（空规则不经过 checkRule，直接跳过）
+
+**实际做了什么**：
+```go
+r := NewRecordFieldResolver(validator.app, validator.new, &RequestInfo{}, true)
+_, err := search.FilterData(vStr).BuildExpr(r)
+```
+1. 构造的 `RequestInfo` 是**空结构体**——没有 auth、没有 body、没有 query、没有 headers
+2. 只调用 `BuildExpr`（语法解析 + 字段名校验），**不调用 `UpdateQuery`，不执行任何 SQL**
+3. 额外还有 `ensureNoSystemRuleChange`：系统集合（如 `_superusers`）禁止修改 MFA.Rule
+
+**保存时能拦截的无效规则**：
+
+| 类型 | 例子 | 错误信息 |
+|------|------|----------|
+| 语法错误（括号不匹配） | `(role = "admin"` | `Invalid rule. Raw error: ...` |
+| 语法错误（非法运算符） | `role + "admin"` | `Invalid rule. Raw error: ...` |
+| 字段名不符合白名单正则 | `@invalid.field = "x"` | `Invalid rule. Raw error: ...` |
+| 引用了集合不存在的字段 | `nonexistent_field = "x"` | `Invalid rule. Raw error: unknown field ...` |
+| 系统集合改规则 | `_superusers` 改 MFA.Rule | `System collection API rule cannot be changed.` |
+
+**保存时放行、但认证时会爆雷的无效规则**：
+
+| 类型 | 例子 | 保存时为什么放过 |
+|------|------|------------------|
+| `@collection.xxx` 引用不存在的集合 | `@collection.nonexistent.id != null` | `BuildExpr` 只做格式校验（符合 `^\@collection\.\w+...$` 正则就行），不查该集合是否真的存在 |
+| 字段类型和比较值不匹配 | `email = 123`（字符串 vs 数字） | `BuildExpr` 不做类型检查，只要字段名合法就通过 |
+| `@request.body.*` 引用的字段运行时类型不兼容 | `@request.body.age > 18`（body.age 传的是字符串） | RequestInfo 是空的，`BuildExpr` 看不到真实值 |
+| 数据库层面异常（表损坏、连接失败等） | — | 根本没执行 SQL |
+
+#### 阶段二：用户认证时的 `wantsMFA`
+入口：[record_helpers.go#L148-L183](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/apis/record_helpers.go#L148-L183)
+
+**触发条件**：`MFA.Enabled = true`（空规则直接返回 `(true, nil)`，全体走 MFA）
+
+**四个失败点**（任意一个出错都会导致所有用户 400）：
+```go
+// 失败点 ①：提取请求上下文
+requestInfo, err := e.RequestInfo()
+if err != nil { return true, err }
+
+// 失败点 ②：语法解析（和保存阶段相同）
+expr, err := search.FilterData(rule).BuildExpr(resolver)
+if err != nil { return true, err }
+
+// 失败点 ③：处理 @collection 关联 JOIN（保存阶段没这步！）
+err = resolver.UpdateQuery(query)
+if err != nil { return true, err }
+
+// 失败点 ④：真实执行 SQL
+err = query.AndWhere(expr).Limit(1).Row(&exists)
+if err != nil && !errors.Is(err, sql.ErrNoRows) { return true, err }
+```
+
+**什么情况才会登录失败**：
+
+只有**失败点 ③ 或 ④** 才是保存阶段放过、认证阶段才暴露的问题：
+- 失败点 ① `RequestInfo`：理论上不会失败（由框架填充），一旦失败通常是框架级异常
+- 失败点 ② `BuildExpr`：保存阶段已经校验过，除非有人手动改数据库写入非法规则，否则不会在这步失败
+- 失败点 ③ `UpdateQuery`：`@collection.xxx` 引用的集合被删除、或关联集合的 ListRule 执行失败 → 所有用户 400
+- 失败点 ④ SQL 执行：字段类型不匹配导致数据库报错、数据库表损坏、连接池耗尽等 → 所有用户 400
+
+#### 配置排障影响汇总
+
+| 现象 | 可能原因 | 排查方向 |
+|------|----------|----------|
+| 保存集合时提示 `Invalid rule` | 语法错误、字段名错误、系统集合改规则 | 检查括号、运算符、字段是否存在、是否为系统集合 |
+| 保存成功但所有用户登录都 400 `Failed to authenticate` | `@collection.xxx` 引用的集合不存在、字段类型不匹配、数据库异常 | 查日志找 `MFA rule failure:` 前缀；逐个检查 `@collection.*` 引用的集合是否存在；在数据库里手动执行 `SELECT 1 FROM users WHERE id='...' AND (你的规则)` 看是否报错 |
+| 保存成功但部分用户 400 | 规则对某些用户行触发类型错误（如 `age > 18` 但 age 对部分用户是 NULL 或字符串） | 检查字段类型一致性；用数据库测试用户行的实际值 |
+| 规则写了但对所有用户都不生效（都不需要 MFA） | 规则执行成功但对所有行返回 false（如 `1 = 0`） | 不属于失败，是规则逻辑本身写错 |
+| 规则写了但所有用户都要 MFA | 规则为空（默认全体），或规则对所有行返回 true | 检查 MFA.Rule 是否为空；用数据库验证逻辑 |
 
 ---
 
@@ -354,6 +433,7 @@ func wantsMFA(e *RequestEvent, record *Record) (bool, error)
 | **sentTo 写入时机** | 创建 OTP 时同步写入 `SetSentTo(email)` | 邮件 SMTP 发送成功后，在 `SendRecordOTP` Hook 里异步回填，值来自 `Message.To[0].Address` | 邮件发送慢/失败时 sentTo 为空 → OTP 登录后不会自动 verified；Hook 改收件地址会改变 sentTo |
 | **验证码长度生效** | 模糊描述"6~8 位" | 配置 `OTP.Length`（默认 8，最小 4）在生成时直接传给 `RandomStringWithAlphabet`；用户提交侧只限制 1~71 位不校验实际长度 | 改数据库能绕过最小 4 位限制；提交侧故意不校验长度以防枚举 |
 | **MFA 规则失败返回** | "视为需要 MFA，不跳过" | 返回 HTTP 400 `Failed to authenticate.`，**不创建 MFA 会话，不发 token**，硬拒绝所有该集合的登录 | 规则写错会在运行时阻断所有用户登录；客户端无法区分是密码错还是规则崩了 |
+| **MFA 规则两阶段校验** | "保存阶段不会报错" | 保存阶段 `checkRule` 只做语法/字段名格式校验（空 RequestInfo + 只调 BuildExpr）；`@collection` 引用不存在、字段类型不匹配、SQL 执行异常等运行时问题**保存阶段放行，认证阶段 wantsMFA 才暴露** | 保存成功不代表规则可用；上线前必须用真实用户登录验证；查日志看 `MFA rule failure:` 前缀定位问题 |
 
 ---
 
@@ -367,6 +447,8 @@ func wantsMFA(e *RequestEvent, record *Record) (bool, error)
 | OTP 查询 / 清理 | [core/otp_query.go](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/core/otp_query.go) |
 | 集合 MFA/OTP 配置 | [core/collection_model_auth_options.go](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/core/collection_model_auth_options.go) |
 | checkMFA / wantsMFA | [apis/record_helpers.go#L146-L256](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/apis/record_helpers.go#L146-L256) |
+| **集合保存 checkRule 校验** | [core/collection_validate.go#L477-L503](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/core/collection_validate.go#L477-L503) |
+| **MFA.Rule 保存时触发校验** | [core/collection_model_auth_options.go#L203-L219](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/core/collection_model_auth_options.go#L203-L219) |
 | 密码认证（入口） | [apis/record_auth_with_password.go](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/apis/record_auth_with_password.go) |
 | 请求 OTP（sentTo 创建处） | [apis/record_auth_otp_request.go](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/apis/record_auth_otp_request.go) |
 | OTP 登录 | [apis/record_auth_with_otp.go](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/apis/record_auth_with_otp.go) |
