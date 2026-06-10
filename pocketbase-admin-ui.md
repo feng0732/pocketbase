@@ -163,19 +163,34 @@ app.routes.superuserOnly("#/settings", pageApplicationSettings);
 // fallbackPath = "#/collections"（hash 为空时默认跳转）
 ```
 
-### 4.3 前端加载流程（关键：动态加载 extensions.js）
+### 4.3 前端加载流程（关键：动态创建模块脚本标签加载 extensions.js）
 
-[ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js#L127-L147)：
+[ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js#L136-L147)：
 
 ```
-1. 页面基础脚本执行完毕
-2. await import(app.pb.buildURL("/_/extensions.js"))
-   ↑ 请求 GET /_/extensions.js，走路径 C（动态合并处理器）
-3. app.store._ready = true
-4. initRouter() → 读 window.location.hash → 渲染对应页面
+1. 页面基础脚本执行完毕（main.js 自身已通过 type="module" 加载）
+2. document.body.appendChild(t.script({
+       type: "module",              // 含顶层 await，必须作为 ES Module 执行
+       src: app.pb.buildURL("/_/extensions.js"),
+       onload:  () => app.store._ready = true,      // 成功 → 标记 ready
+       onerror: (err) => {                          // 失败 → 打警告后仍标记 ready
+           console.warn("Failed to load extensions:", err);
+           app.store._ready = true;
+       },
+   }))
+   ↑ 创建 <script type="module"> DOM 元素，挂载到 document.body
+     浏览器发起 GET /_/extensions.js，走路径 C（动态合并处理器）
+3. 脚本加载完成（无论成功/失败）→ app.store._ready = true
+4. watch 触发 → initRouter() → 读 window.location.hash → 渲染对应页面
 ```
 
 **也就是说，路径 C（扩展动态脚本）是前端页面加载流程的一部分，在路由初始化之前执行。**
+
+#### 为什么用 `<script type="module">` 而不是 `import()`？
+
+服务端合并后的响应内容为 `await (async function(){...})();await (async function(){...})();...`，包含顶层 `await`，必须在 ES Module 上下文中执行。
+- `<script type="module">` 天然支持顶层 await
+- 同时通过 `onload`/`onerror` 回调，无论加载成功还是失败都能继续执行后续流程（不阻塞路由初始化）
 
 ---
 
@@ -501,8 +516,14 @@ for _, ext := range se.UIExtensions {
         ▼
 浏览器执行 JS，main.js 启动
         │
-        └── await import(app.pb.buildURL("/_/extensions.js"))
-                → GET /_/extensions.js
+        └── document.body.appendChild(t.script({
+                type: "module",
+                src: app.pb.buildURL("/_/extensions.js"),
+                onload:  () => app.store._ready = true,
+                onerror: (err) => { console.warn(...); app.store._ready = true },
+            }))
+            ↑ 创建 <script type="module"> DOM 元素并挂载
+              浏览器自动发起 GET /_/extensions.js
         │
         ▼
 [HTTP N+1] GET /_/extensions.js（走路径 C）
@@ -528,9 +549,14 @@ for _, ext := range se.UIExtensions {
         │   响应头：uiGroup 中间件设 Cache-Control（非 dev）、CSP、Gzip
         │   响应体：await (async function(){ext1_main})();await (async function(){ext3_main})();
         ▼
-扩展脚本执行完毕
+<script type="module"> 接收响应，作为 ES Module 执行（支持顶层 await）
         │
-        ├── app.store._ready = true
+        ├── 成功执行：onload 回调 → app.store._ready = true
+        └── 加载失败：onerror 回调 → console.warn + app.store._ready = true（不阻塞）
+        │
+        ▼
+app.store._ready = true → watch 回调触发
+        │
         ├── initRouter() 被调用
         ├── window.location.hash = "#/collections"
         └── Shablon router 匹配 "#/collections" → 渲染集合列表页 ✓
@@ -604,7 +630,7 @@ GET /_/collections（注意：没有 #，是错误 URL）
 | [ui/.env](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/.env) | 生产环境变量（`PB_BACKEND_URL = "../"`） |
 | [ui/package.json](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/package.json) | npm build/dev 脚本 |
 | [ui/src/router.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/router.js) | 前端 hash 路由定义（全部 #/ 开头） |
-| [ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js) | 前端入口，动态 import `/_/extensions.js`（触发路径 C），初始化路由 |
+| [ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js) | 前端入口，通过 `t.script({type:"module"})` 创建 `<script type="module">` 标签加载 `/_/extensions.js`（触发路径 C），onload/onerror 回调触发路由初始化 |
 | [ui/src/pb.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/pb.js) | JS SDK 初始化（使用 `PB_BACKEND_URL` 相对路径） |
 | [apis/serve.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/serve.go#L83-L99) | 注册路径 A：`/_/{path...}` 路由与缓存/CSP/Gzip 中间件 |
 | [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L93-L171) | `Static()` 静态文件处理器（路径 A 和 B 共用，含 `indexFallback=false`） |
