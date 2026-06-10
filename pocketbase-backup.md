@@ -6,16 +6,16 @@
 
 | 模块层级 | 主要文件 | 职责 |
 |---------|---------|------|
-| API 层 | [apis/backup.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/apis/backup.go) | HTTP 路由注册、请求鉴权、响应处理 |
-| API 层 | [apis/backup_create.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/apis/backup_create.go) | 创建备份的表单校验与请求处理 |
-| API 层 | [apis/backup_upload.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/apis/backup_upload.go) | 备份文件上传的表单校验与请求处理 |
-| 核心层 | [core/base_backup.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go) | 备份创建、恢复、定时自动备份的核心业务逻辑 |
-| 核心层 | [core/base.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base.go) | 备份文件系统初始化、进程重启、启动清理 |
-| 核心层 | [core/events.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/events.go) | BackupEvent 事件结构体定义 |
-| 核心层 | [core/db_tx.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/db_tx.go) | RunInTransaction / AuxRunInTransaction 事务实现 |
-| 工具层 | [tools/archive/create.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/archive/create.go) | ZIP 压缩归档实现 |
-| 工具层 | [tools/archive/extract.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/archive/extract.go) | ZIP 解压提取实现 |
-| 工具层 | [tools/osutils/dir.go](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/osutils/dir.go) | 目录内容移动（原子替换核心，含局部回滚） |
+| API 层 | [apis/backup.go](apis/backup.go) | HTTP 路由注册、请求鉴权、响应处理 |
+| API 层 | [apis/backup_create.go](apis/backup_create.go) | 创建备份的表单校验与请求处理 |
+| API 层 | [apis/backup_upload.go](apis/backup_upload.go) | 备份文件上传的表单校验与请求处理 |
+| 核心层 | [core/base_backup.go](core/base_backup.go) | 备份创建、恢复、定时自动备份的核心业务逻辑 |
+| 核心层 | [core/base.go](core/base.go) | 备份文件系统初始化、进程重启、启动清理 |
+| 核心层 | [core/events.go](core/events.go) | BackupEvent 事件结构体定义 |
+| 核心层 | [core/db_tx.go](core/db_tx.go) | RunInTransaction / AuxRunInTransaction 事务实现 |
+| 工具层 | [tools/archive/create.go](tools/archive/create.go) | ZIP 压缩归档实现 |
+| 工具层 | [tools/archive/extract.go](tools/archive/extract.go) | ZIP 解压提取实现 |
+| 工具层 | [tools/osutils/dir.go](tools/osutils/dir.go) | 目录内容移动（原子替换核心，含局部回滚） |
 
 ---
 
@@ -39,6 +39,7 @@ core/base_backup.go: CreateBackup()
         │  ├─ RunInTransaction（阻塞写操作）
         │  │     └─ AuxRunInTransaction
         │  │           ├─ WAL Checkpoint: PRAGMA wal_checkpoint(TRUNCATE)
+        │  │           │     (DB 和 AuxDB 各执行一次，错误全部忽略)
         │  │           └─ 调用 archive.Create()
         │  ├─ 通过 NewBackupsFilesystem() 持久化
         │  └─ 清理临时文件
@@ -52,19 +53,20 @@ tools/archive/create.go: Create()
 ### 2.2 关键边界点
 
 **边界 1：并发互斥锁**
-- 位置：[core/base_backup.go#L45-L50](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L45-L50)
+- 位置：[core/base_backup.go#L45-L50](core/base_backup.go#L45-L50)
 - 机制：通过 `app.Store().Has(StoreKeyActiveBackup)` 检查是否有进行中的备份/恢复操作
 - 作用：防止并发备份或备份与恢复同时执行导致的数据不一致
 
 **边界 2：事务写阻塞**
-- 位置：[core/base_backup.go#L83-L92](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L83-L92)
+- 位置：[core/base_backup.go#L83-L92](core/base_backup.go#L83-L92)
 - 机制：嵌套调用 `RunInTransaction` + `AuxRunInTransaction`
-- 实现细节：[core/db_tx.go#L14-L49](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/db_tx.go#L14-L49) 中使用 `NonconcurrentDB` 连接开启 SQLite 事务
+- 实现细节：[core/db_tx.go#L14-L49](core/db_tx.go#L14-L49) 中使用 `NonconcurrentDB` 连接开启 SQLite 事务
 - 作用：利用 SQLite 事务锁，临时阻塞其他数据库写入，确保归档期间 data.db 不会被修改
 
 **边界 3：WAL Checkpoint（详细含义）**
-- 位置：[core/base_backup.go#L87-L88](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L87-L88)
-- 执行语句：`PRAGMA wal_checkpoint(TRUNCATE)`
+- 位置：[core/base_backup.go#L85-L88](core/base_backup.go#L85-L88)
+- 执行语句：对 **主库** 和 **辅助库** 分别执行 `PRAGMA wal_checkpoint(TRUNCATE)`
+- 错误处理：`Execute()` 返回值被完全丢弃，代码注释说明 "errors are ignored because it is not that important and the PRAGMA may not be supported by the used driver"
 
 **WAL（Write-Ahead Logging）机制背景：**
 SQLite 默认使用 rollback journal，WAL 模式是替代方案：
@@ -85,11 +87,10 @@ SQLite 默认使用 rollback journal，WAL 模式是替代方案：
 1. 确保 `data.db` 本身是完整的最新状态（而不是依赖 WAL 回放）
 2. 截断 `data.db-wal` 为空文件，避免备份包里同时包含 `data.db` 和大体积 WAL
 3. 如果不执行，备份出来的 `data.db` 可能缺失最后一批已提交事务，必须配合对应的 WAL 才能完整恢复
-4. 代码注释说明：`errors are ignored because it is not that important and the PRAGMA may not be supported by the used driver`
 
 **边界 4：目录排除列表**
-- 位置：[core/base_backup.go#L57-L63](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L57-L63)
-- 备份时排除的 `pb_data` 根目录条目（常量定义见 [core/base.go#L40-L46](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base.go#L40-L46)）：
+- 位置：[core/base_backup.go#L57-L63](core/base_backup.go#L57-L63)
+- 备份时排除的 `pb_data` 根目录条目（常量定义见 [core/base.go#L40-L46](core/base.go#L40-L46)）：
   - `backups` (`LocalBackupsDirName`) — 备份目录自身，避免无限递归打包已有备份
   - `.pb_temp_to_delete` (`LocalTempDirName`) — 临时目录，下次 Bootstrap 会自动删除整个目录
   - `.notify` (`LocalNotifyDirName`) — 多实例间运行时状态同步目录，属于运行时临时数据
@@ -97,12 +98,12 @@ SQLite 默认使用 rollback journal，WAL 模式是替代方案：
   - `lost+found` (`lostFoundDirName`) — ext 等文件系统 fsck 产生的孤儿文件目录
 
 **边界 5：存储层抽象**
-- 位置：[core/base.go#L739-L749](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base.go#L739-L749)
+- 位置：[core/base.go#L739-L749](core/base.go#L739-L749)
 - 机制：`NewBackupsFilesystem()` 根据 `Settings().Backups.S3` 配置返回 S3 或本地文件系统
 - 本地存储路径：`pb_data/backups/`
 
 ### 2.3 备份文件命名规则
-- 位置：[core/base_backup.go#L410-L422](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L410-L422)
+- 位置：[core/base_backup.go#L410-L422](core/base_backup.go#L410-L422)
 - 格式：`{prefix}{app_name}_{YYYYMMDDHHMMSS}.zip`
 - 自动备份前缀：`@auto_pb_backup_`
 - 手动备份前缀：`pb_backup_`
@@ -132,18 +133,18 @@ tools/archive/create.go: Create(srcDir, destZipPath, exclude...)
 **关键边界点：**
 
 **边界 1：排除路径匹配逻辑**
-- 位置：[tools/archive/create.go#L56-L61](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/archive/create.go#L56-L61)
+- 位置：[tools/archive/create.go#L56-L61](tools/archive/create.go#L56-L61)
 - 两种匹配方式：
   1. 精确匹配：`ignore == name`
   2. 目录前缀匹配：`clean(name) + "/"` 以 `clean(ignore) + "/"` 开头
 - 注意：只在遍历路径上排除，不会递归进入被排除的子目录（WalkDir 本身的行为）
 
 **边界 2：压缩级别**
-- 位置：[tools/archive/create.go#L31-L33](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/archive/create.go#L31-L33)
+- 位置：[tools/archive/create.go#L31-L33](tools/archive/create.go#L31-L33)
 - 使用 `flate.BestSpeed`（级别 1）而非默认 `DefaultCompression`（级别 6），优先保证备份速度
 
 **边界 3：错误清理**
-- 位置：[tools/archive/create.go#L36-L39](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/archive/create.go#L36-L39)
+- 位置：[tools/archive/create.go#L36-L39](tools/archive/create.go#L36-L39)
 - 若压缩过程出错，使用 `errors.Join` 聚合：关闭 writer、关闭文件、删除不完整的 zip
 
 ### 3.2 Extract — 解压提取
@@ -167,11 +168,11 @@ tools/archive/extract.go: Extract(srcZipPath, destDir)
 **关键边界点：**
 
 **边界 1：Zip Slip 防护**
-- 位置：[tools/archive/extract.go#L42-L45](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/archive/extract.go#L42-L45)
+- 位置：[tools/archive/extract.go#L42-L45](tools/archive/extract.go#L42-L45)
 - 检查解压后路径是否仍在目标目录内，防止恶意 zip 通过 `../../etc/passwd` 等相对路径写入任意位置
 
 **边界 2：仅处理常规文件**
-- 位置：[tools/archive/extract.go#L54-L74](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/archive/extract.go#L54-L74)
+- 位置：[tools/archive/extract.go#L54-L74](tools/archive/extract.go#L54-L74)
 - 只提取 **目录** 和 **普通文件**（`Mode().IsRegular()`）
 - 符号链接、命名管道、套接字、设备文件等非常规文件会被静默跳过
 
@@ -187,7 +188,7 @@ HTTP POST /api/backups/{key}/restore
         ▼
 apis/backup.go: backupRestore()
         │  ├─ 并发检查
-        │  ├─ 校验备份文件存在
+        │  ├─ 校验备份文件存在（fsys.Exists 的错误被忽略）
         │  └─ routine.FireAndForget — 异步执行（先返回 204 No Content）
         │        └─ time.Sleep(1s) — 等待 HTTP 响应写出后再开始实际恢复
         ▼
@@ -213,6 +214,8 @@ core/base_backup.go: RestoreBackup()
         │  │           ├─ Step A: MoveDirContent(pb_data → oldTempDataDir, exclude)
         │  │           └─ Step B: MoveDirContent(extractedDataDir → pb_data, exclude)
         │  │
+        │  ├─ replaceErr != nil → 直接 return（⚠️ 不触发全局回滚）
+        │  │
         │  ├─ 定义 revertDataDirChanges() 回滚函数（仅 Restart 失败时调用）
         │  │
         │  └─ e.App.Restart() — execve 替换当前进程
@@ -225,31 +228,33 @@ core/base.go: Restart()
 ### 4.2 关键边界点
 
 **边界 1：平台限制**
-- 位置：[core/base_backup.go#L171-L173](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L171-L173)
+- 位置：[core/base_backup.go#L171-L173](core/base_backup.go#L171-L173)
 - 恢复功能仅支持 UNIX 系统，Windows 直接返回错误
 - 原因：依赖 `execve` 系统调用进行原子进程替换（Windows 无此机制）
 
 **边界 2：本地 vs S3 解压差异**
-- 位置：[core/base_backup.go#L198-L243](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L198-L243)
+- 位置：[core/base_backup.go#L198-L243](core/base_backup.go#L198-L243)
 - S3：先下载 blob 到临时 zip 文件，再解压（blob.Reader 不实现 `ReaderAt`，而 `zip.OpenReader` 需要随机访问）
 - 本地：直接读取 `pb_data/backups/` 下的 zip 文件路径传给 `archive.Extract`，避免额外磁盘拷贝
 
 **边界 3：恢复前完整性校验**
-- 位置：[core/base_backup.go#L246-L249](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L246-L249)
+- 位置：[core/base_backup.go#L245-L249](core/base_backup.go#L245-L249)
 - 解压后必须存在 `data.db` 文件，否则视为无效备份直接返回错误
 - 此时 `pb_data` 尚未被触碰，无任何副作用
+- 注意：API 层 `backupRestore()` 中 `fsys.Exists(name)` 的错误被用 `_` 忽略（见 [apis/backup.go#L142](apis/backup.go#L142)）
 
 **边界 4：原子替换（核心）**
-- 位置：[core/base_backup.go#L253-L272](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L253-L272)
+- 位置：[core/base_backup.go#L253-L272](core/base_backup.go#L253-L272)
 - 使用 `osutils.MoveDirContent` 进行两步原子移动：
   - **Step A**：将当前 `pb_data` 内容（排除列表）移到 `oldTempDataDir`
   - **Step B**：将 `extractedDataDir` 内容移到 `pb_data`
 - 整个过程包裹在两层 Transaction 中，阻塞数据库写入
+- **注意：RestoreBackup 中不执行 WAL checkpoint**（与 CreateBackup 不同）
 
 **边界 5：失败回滚机制（见下方 §4.3 详细分析）**
 
 **边界 6：恢复时的排除列表**
-- 位置：[core/base_backup.go#L168](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L168)
+- 位置：[core/base_backup.go#L168](core/base_backup.go#L168)
 - 比备份时少排除 `.notify`：
   - `backups` — 保留现有备份不被覆盖
   - `.pb_temp_to_delete` — 临时目录，含本次恢复的 old / extracted 数据
@@ -289,7 +294,7 @@ core/base.go: Restart()
 │  │   ├─ 此时磁盘状态：                                                  │
 │  │   │   ├── pb_data/  = 排除列表中的条目 + Step B 部分成功的备份数据    │
 │  │   │   ├── oldTempDataDir/  = Step A 搬走的原 pb_data 完整数据        │
-│  │   │   └── extractedDataDir/  = 剩余未移动的备份数据                  │
+│  │   │   └── extractedDataDir/  = Step B 回滚后还原的剩余备份数据       │
 │  │   ├─ replaceErr 被直接 return                                        │
 │  │   ├─ extractedDataDir 通过 defer 删除                                │
 │  │   ├─ ⚠️ oldTempDataDir **没有 defer 删除**                           │
@@ -302,7 +307,7 @@ core/base.go: Restart()
 │  ├─ 调用 revertDataDirChanges() 真正回滚：                               │
 │  │   ├─ MoveDirContent(pb_data → extractedDataDir)  — 退回备份数据     │
 │  │   └─ MoveDirContent(oldTempDataDir → pb_data)   — 还原原数据        │
-│  ├─ 若回滚也失败 → panic(fmt.Errorf) 终止进程                            │
+│  ├─ 若回滚也失败 → panic(revertErr) 终止进程                             │
 │  └─ 后果：要么 pb_data 恢复为原状态，要么进程崩溃                         │
 │                                                                       │
 └───────────────────────────────────────────────────────────────────────┘
@@ -312,13 +317,13 @@ core/base.go: Restart()
 
 | 回滚层级 | 实现位置 | 触发时机 | 回滚范围 |
 |---------|---------|---------|---------|
-| 局部回滚 `tryRollback()` | [tools/osutils/dir.go#L37-L54](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/osutils/dir.go#L37-L54) | 单次 `MoveDirContent` 内部某条 `os.Rename` 失败时 | 仅回滚本次 `MoveDirContent` 已成功移动的条目，不影响其他操作 |
-| 全局回滚 `revertDataDirChanges()` | [core/base_backup.go#L274-L288](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L274-L288) | 仅在 `App.Restart()` 返回错误时调用 | 反向执行两步完整的 `MoveDirContent`，将 pb_data 恢复到恢复前状态 |
+| 局部回滚 `tryRollback()` | [tools/osutils/dir.go#L37-L54](tools/osutils/dir.go#L37-L54) | 单次 `MoveDirContent` 内部某条 `os.Rename` 失败时 | 仅回滚本次 `MoveDirContent` 已成功移动的条目，不影响其他操作 |
+| 全局回滚 `revertDataDirChanges()` | [core/base_backup.go#L274-L288](core/base_backup.go#L274-L288) | 仅在 `App.Restart()` 返回错误时调用 | 反向执行两步完整的 `MoveDirContent`，将 pb_data 恢复到恢复前状态 |
 
 **关键结论：**
-- Step A 成功 + Step B 失败这个场景是**危险窗口**：原数据已搬走但没有触发全局回滚
-- 这个窗口的存在是因为 `replaceErr` 直接 return，没有走 `revertDataDirChanges` 逻辑
-- `oldTempDataDir` 没有独立的 `defer os.RemoveAll`，依赖于上层 `LocalTempDirName` 目录在下次 Bootstrap 时整体删除（见 [core/base.go#L431](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base.go#L431)）
+- Step A 成功 + Step B 失败这个场景是**危险窗口**：原数据已搬出 pb_data，但没有触发全局回滚
+- 这个窗口的存在是因为 [core/base_backup.go#L270-L272](core/base_backup.go#L270-L272) 中 `replaceErr` 直接 return，没有走 `revertDataDirChanges` 逻辑
+- `oldTempDataDir` 没有独立的 `defer os.RemoveAll`（只有 `extractedDataDir` 在 [core/base_backup.go#L194-L195](core/base_backup.go#L194-L195) 有），依赖于上层 `LocalTempDirName` 目录在下次 Bootstrap 时整体删除（见 [core/base.go#L431](core/base.go#L431)）
 - 下次 Bootstrap 时 `os.RemoveAll(pb_data/.pb_temp_to_delete)` 会把原数据一并删除，如果 Step B 失败后未手动干预，原数据永久丢失
 
 ---
@@ -327,7 +332,7 @@ core/base.go: Restart()
 
 ### 5.1 实现机制
 
-位置：[tools/osutils/dir.go#L20-L79](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/tools/osutils/dir.go#L20-L79)
+位置：[tools/osutils/dir.go#L20-L79](tools/osutils/dir.go#L20-L79)
 
 ```
 MoveDirContent(src, dest, rootExclude...)
@@ -342,7 +347,7 @@ MoveDirContent(src, dest, rootExclude...)
         │     └─ 失败：调用 tryRollback()
         │           ├─ 遍历 moved map，反向 os.Rename(new, old)
         │           ├─ 若 dest 是本次新建且全部回滚成功，尝试 os.Remove(dest)
-        │           └─ 聚合所有错误后返回
+        │           └─ errors.Join 聚合所有错误后返回
         │
         └─ 全部成功：返回 nil
 ```
@@ -358,7 +363,7 @@ MoveDirContent(src, dest, rootExclude...)
 
 ## 六、自动备份（Cron）
 
-位置：[core/base_backup.go#L304-L408](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/core/base_backup.go#L304-L408)
+位置：[core/base_backup.go#L304-L408](core/base_backup.go#L304-L408)
 
 ### 6.1 触发时机
 
@@ -376,7 +381,7 @@ MoveDirContent(src, dest, rootExclude...)
 
 ## 七、API 端点汇总
 
-所有端点定义在 [apis/backup.go#L17-L25](file:///d:/fz/0601/solo-dogfeeding/code/164-pocketbase/apis/backup.go#L17-L25)：
+所有端点定义在 [apis/backup.go#L17-L25](apis/backup.go#L17-L25)：
 
 | 方法 | 路径 | 权限 | 说明 |
 |-----|------|------|------|
