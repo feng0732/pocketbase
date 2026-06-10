@@ -281,14 +281,18 @@ return e.App.OnRecordAuthWithOAuth2Request().Trigger(event, func(e *core.RecordA
 
 **事件数据结构**：`core/events.go` 中的 `RecordAuthWithOAuth2RequestEvent`
 
-| 字段 | 说明 |
-|------|------|
-| `ProviderName` | e.g. "google" |
-| `ProviderClient` | Provider 接口实例，可调用额外 API |
-| `Record` | 定位到的用户（可能为 nil，表示新用户） |
-| `OAuth2User` | 标准化的第三方用户信息 |
-| `CreateData` | 前端传入的额外创建数据 |
-| `IsNewRecord` | 是否新用户 |
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `ProviderName` | `string` | e.g. "google" |
+| `ProviderClient` | `Provider` | Provider 接口实例，可调用额外 API |
+| `Record` | `*Record` | 定位到的用户（可能为 nil，表示新用户） |
+| `OAuth2User` | `*AuthUser` | 标准化的第三方用户信息（结构体，有独立字段） |
+| `CreateData` | `map[string]any` | 前端传入的额外创建数据 |
+| `IsNewRecord` | `bool` | 是否新用户 |
+
+> 🔍 **事件字段 vs 响应 meta 的区别**：
+> - **事件字段**（本钩子）：`OAuth2User` 是 `*AuthUser` 结构体对象，`IsNewRecord` 是独立的 bool 字段，两者并列存在于事件对象上
+> - **最终响应 meta**（HTTP 返回值）：是 `map[string]any` 扁平结构——把 `OAuth2User` 的 JSON 字段整体展开后，额外追加一个 `"isNew": true/false` 键值对（详见下文 meta 组装代码）
 
 开发者可以在此钩子中：
 - 修改 `e.Record` 自定义账号查找逻辑
@@ -308,29 +312,76 @@ return e.App.OnRecordAuthWithOAuth2Request().Trigger(event, func(e *core.RecordA
 #### 会话返回阶段内部执行顺序
 
 ```
-RecordAuthResponse(e, authRecord, "oauth2", {OAuth2User, IsNewRecord})
-│
-├─ ① 生成 auth token                       ← 最先执行，失败直接 500
-│     authRecord.NewAuthToken()
-│
-└─ recordAuthResponse(e, authRecord, token, authMethod, meta)
-      │
-      ├─ ② 超级用户 IP 白名单校验           ← 仅 _superusers 集合生效
-      │     SuperuserIPs 非空时严格匹配 e.RealIP()
-      │
-      ├─ ③ AuthRule 校验                    ← CanAccessRecord
-      │
-      ├─ ④ OnRecordAuthRequest 事件钩子
-      │   └─ 钩子回调内（开发者 Written() 可提前返回）
-      │        │
-      │        ├─ ⑤ MFA 检查               ← 需要时返回 401 + mfaId
-      │        │
-      │        ├─ ⑥ 响应富化                ← Unhide / IgnoreEmailVisibility / expand
-      │        │
-      │        ├─ ⑦ 登录告警 AuthAlert      ← 新设备指纹发邮件
-      │        │
-      │        └─ ⑧ 最终响应 JSON           ← HTTP 200 {token, record, meta}
+RecordAuthResponse(e, authRecord, "oauth2", meta)
+  │                                 │
+  │                                 └─ meta 是扁平 map：
+  │                                     {expiry, rawUser, id, name, username,
+  │                                      avatarURL, accessToken, refreshToken,
+  │                                      email, avatarUrl, isNew}
+  │
+  ├─ ① 生成 auth token                       ← 最先执行，失败直接 500
+  │     authRecord.NewAuthToken()
+  │
+  └─ recordAuthResponse(e, authRecord, token, authMethod, meta)
+        │
+        ├─ ② 超级用户 IP 白名单校验           ← 仅 _superusers 集合生效
+        │     SuperuserIPs 非空时严格匹配 e.RealIP()
+        │
+        ├─ ③ AuthRule 校验                    ← CanAccessRecord
+        │
+        ├─ ④ OnRecordAuthRequest 事件钩子
+        │   └─ 钩子回调内（开发者 Written() 可提前返回）
+        │        │
+        │        ├─ ⑤ MFA 检查               ← 需要时返回 401 + mfaId
+        │        │
+        │        ├─ ⑥ 响应富化                ← Unhide / IgnoreEmailVisibility / expand
+        │        │
+        │        ├─ ⑦ 登录告警 AuthAlert      ← 新设备指纹发邮件
+        │        │
+        │        └─ ⑧ 最终响应 JSON           ← HTTP 200 {token, record, meta}
 ```
+
+#### meta 的实际组装方式
+
+在 `oauth2Submit` 成功返回后、调用 `RecordAuthResponse` 之前，meta 按以下逻辑构造：
+
+```go
+// 1. 创建空 map
+meta := map[string]any{}
+
+// 2. 把事件上的 *AuthUser 结构体先 Marshal 成 JSON，再 Unmarshal 到 map 中
+//    相当于把 AuthUser 的所有 JSON 字段"扁平化"展开到 meta
+rawOAuth2User, err := json.Marshal(e.OAuth2User)
+err = json.Unmarshal(rawOAuth2User, &meta)
+
+// 3. 额外追加一个 isNew 字段（注意：是 isNew，不是事件字段的 IsNewRecord）
+meta["isNew"] = e.IsNewRecord
+
+// 4. 传入 RecordAuthResponse
+return RecordAuthResponse(e.RequestEvent, e.Record, core.MFAMethodOAuth2, meta)
+```
+
+**代码位置**：`apis/record_auth_with_oauth2.go` 第 159-171 行
+
+**最终 HTTP 响应中 meta 的扁平结构**（来自 `AuthUser` JSON 字段 + isNew）：
+
+| 键 | 来源 | 说明 |
+|----|------|------|
+| `expiry` | `AuthUser.Expiry` | token 过期时间 |
+| `rawUser` | `AuthUser.RawUser` | Provider 返回的原始用户信息 map |
+| `id` | `AuthUser.Id` | 第三方用户唯一 ID |
+| `name` | `AuthUser.Name` | 显示名称 |
+| `username` | `AuthUser.Username` | 用户名 |
+| `avatarURL` | `AuthUser.AvatarURL` | 头像 URL |
+| `accessToken` | `AuthUser.AccessToken` | 第三方 access_token |
+| `refreshToken` | `AuthUser.RefreshToken` | 第三方 refresh_token |
+| `email` | `AuthUser.Email` | 已验证邮箱 |
+| `avatarUrl` | `AuthUser.AvatarUrl` | 已废弃字段，兼容 v0.22 |
+| `isNew` | `event.IsNewRecord` | 是否为新注册用户 |
+
+> 🔍 **关键区分**：
+> - `OnRecordAuthWithOAuth2Request` 事件的字段是 **`OAuth2User`（*AuthUser 结构体）和 `IsNewRecord`（独立 bool）**，两者并列
+> - 最终 HTTP 响应的 meta 是 **扁平化 map**，`OAuth2User` 被展开成多个顶级键，`IsNewRecord` 被重命名为小写的 `isNew`
 
 #### ③ AuthRule 校验详解
 
@@ -688,7 +739,7 @@ return e.App.OnRecordAuthRequest().Trigger(event, func(e *core.RecordAuthRequest
 | `Token` | 步骤①已生成的 JWT（开发者可替换） |
 | `Record` | 当前认证用户（开发者可修改字段） |
 | `AuthMethod` | 对于 OAuth2 固定为 `"oauth2"` |
-| `Meta` | OAuth2 场景下为 `{OAuth2User, IsNewRecord}` |
+| `Meta` | OAuth2 场景下为扁平化 map（AuthUser JSON 字段展开 + isNew 布尔字段），详见"meta 的实际组装方式" |
 
 开发者可以在此钩子中：
 - 修改 `e.Token` 替换为自定义 token 格式
@@ -786,7 +837,7 @@ return execAfterSuccessTx(true, e.App, func() error {
 
 **代码位置**：`apis/record_helpers.go` 第 127-142 行
 
-- OAuth2 场景下 `meta` 包含 `OAuth2User`（第三方用户信息）和 `IsNewRecord`（是否新注册用户）
+- OAuth2 场景下 `meta` 是**扁平 map**：`AuthUser` 的 JSON 字段整体展开（expiry, rawUser, id, name, username, avatarURL, accessToken, refreshToken, email, avatarUrl），额外追加 `"isNew": true/false`
 - 通过 `execAfterSuccessTx` 确保响应只在数据库事务成功提交后才写入
 
 > 💡 PocketBase **不使用服务端 session 和 cookie**。会话完全由前端保存 JWT token，每次请求通过 `Authorization` 头携带。
