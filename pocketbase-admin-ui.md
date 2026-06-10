@@ -1,25 +1,46 @@
 # PocketBase Admin UI 与静态资源嵌入流程分析
 
-## 一、整体架构概览
+## 一、整体架构：三条资源返回路径
 
-PocketBase 的 Admin UI（超级用户管理后台）采用 **"前端打包 → Go embed 嵌入 → HTTP 静态服务"** 的三段式架构，最终实现**单二进制分发**——所有前端资源被编译进 Go 可执行文件中，无需额外部署。
-
-完整流程链路：
+PocketBase Admin UI 挂载在 `/_/` 前缀下，但根据资源类型不同，实际上存在 **三条完全独立的代码执行路径**：
 
 ```
-[Vite 前端构建]  →  ui/dist/  →  [Go embed 编译时嵌入]  →  二进制文件
-                                                         ↓
-                                              [HTTP 路由 /_/*]
-                                                         ↓
-                                              [Static 处理器]
-                                                         ↓
-                                              [浏览器渲染 + 前端 Hash 路由]
+                              ┌───────────────────────────────────────────────────────────┐
+                              │                    HTTP 路由 /_/*                          │
+                              └───────────────────────────────────────────────────────────┘
+                                                          │
+                                                          │ 路由匹配（最具体优先）
+                                                          ▼
+              ┌───────────────────────────────┬───────────────────────────────┬──────────────────────────────────┐
+              │  路径 A：嵌入打包静态资源        │  路径 B：扩展自有静态资源        │  路径 C：动态合并扩展入口脚本        │
+              │                               │                               │                                   │
+              │  典型 URL：                    │  典型 URL：                    │  典型 URL：                        │
+              │    /_/assets/index-xxx.js     │    /_/extensions/ext1/a.png   │    /_/extensions.js               │
+              │    /_/libs/tinymce/...        │    /_/extensions/ext2/style.css│                                   │
+              │    /_/fonts/...               │                               │                                   │
+              │    /_/images/...              │                               │                                   │
+              │    /_/index.html (→ /_/)      │                               │                                   │
+              │    /_/ (hash 路由页面)         │                               │                                   │
+              │                               │                               │                                   │
+              │  处理器：                      │  处理器：                      │  处理器：                          │
+              │    Static(ui.DistDirFS,false) │    Static(ext.FS,false)        │    匿名函数（非 Static！）          │
+              │                               │                               │                                   │
+              │  文件来源：                    │  文件来源：                    │  文件来源：                        │
+              │    Go embed 编译时嵌入          │    运行时注入的 ext.FS          │    运行时遍历所有扩展，              │
+              │    ui/dist/ 目录                │    （每个扩展独立）              │    逐个 ext.FS.Open("main.js")      │
+              │                               │                               │    动态拼接 IIFE 包裹              │
+              │                               │                               │                                   │
+              │  注册时机：                    │  注册时机：                    │  注册时机：                        │
+              │    Serve() 中                  │    OnServe Hook                │    OnServe Hook                    │
+              │    （OnServe 之前）              │    Priority 9999               │    Priority 9999                   │
+              │                               │                               │                                   │
+              │  内容发送：                    │  内容发送：                    │  内容发送：                        │
+              │    http.ServeContent()         │    http.ServeContent()         │    re.Stream("text/javascript",buf)│
+              │    (Range/协商缓存/Content-Type│    (Range/协商缓存/Content-Type│    (固定 Content-Type，不支持 Range)│
+              └───────────────────────────────┴───────────────────────────────┴──────────────────────────────────┘
 ```
 
-**核心设计选择**：
-- 前端使用 **Hash 路由**（`/_/#/collections`），而非 History API，因此服务端无需 SPA fallback
-- Vite `base: "./"` 配合 `PB_BACKEND_URL = "../"`，确保资源和 API 路径使用相对引用
-- 服务端 `indexFallback = false`，所有非 hash 路由的直连访问直接返回 404
+前端使用 Hash 路由（`/_/#/collections`），因此服务端 `indexFallback=false`，所有非 hash 直连 `/_/collections` 返回 404。
 
 ---
 
@@ -46,16 +67,14 @@ PocketBase 的 Admin UI（超级用户管理后台）采用 **"前端打包 → 
 import { defineConfig } from "vite";
 
 export default defineConfig({
-    envPrefix: "PB",           // 只有 PB_ 开头的 env 变量会被注入前端
+    envPrefix: "PB",
     base: "./",                // ★ 关键 1：资源引用使用相对路径 ./
     build: {
         chunkSizeWarningLimit: 1000,
         reportCompressedSize: false,
     },
     resolve: {
-        alias: {
-            "@": __dirname + "/src",
-        },
+        alias: { "@": __dirname + "/src" },
     },
 });
 ```
@@ -66,63 +85,42 @@ export default defineConfig({
 PB_BACKEND_URL = "../"      # ★ 关键 2：API 后端地址也用相对路径
 ```
 
-#### 为什么必须用相对路径？
+#### 相对路径的必要性
 
-Admin UI 被挂载在 `/_/` 子路径下。如果使用绝对路径 `/assets/xxx.js`，浏览器会从域名根路径请求，导致 404（应该是 `/_/assets/xxx.js`）。使用 `./` 后，资源引用会基于当前页面 URL 的目录解析：
+Admin UI 挂载在 `/_/` 子路径下：
 
-| 当前页面 URL | `<script src="./assets/a.js">` 解析结果 |
-|-------------|-----------------------------------------|
-| `http://host:8090/_/` | `http://host:8090/_/assets/a.js` ✓ |
-| `http://host:8090/_/libs/tinymce/...` | `http://host:8090/_/libs/tinymce/assets/a.js`（tinymce 内部引用）|
+| 当前页面 URL | `<script src="./assets/a.js">` 解析 | `PB_BACKEND_URL="../"` + API `/api/collections` 解析 |
+|-------------|------------------------------------|-----------------------------------------------------|
+| `http://host:8090/_/` | `http://host:8090/_/assets/a.js` ✓ | `http://host:8090/api/collections` ✓ |
 
-同理，`PB_BACKEND_URL = "../"` 使得 SDK 发 API 请求时：
-- 从 `/_/` 页面出发，`../` 解析到根路径 `/`
-- 请求 `/api/collections` 最终变为 `http://host:8090/api/collections` ✓
+### 2.3 构建产物目录（走路径 A：嵌入静态）
 
-### 2.3 入口 HTML 构建前后对比
-
-| 源文件 [ui/index.html](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/index.html) | 构建后 [ui/dist/index.html](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/dist/index.html) |
-|---|---|
-| `<script src="/libs/shablon/shablon.iife.js">` | `<script src="./libs/shablon/shablon.iife.js">` |
-| `<script type="module" src="/src/main.js">` | `<script type="module" src="./assets/index-V68uRsWE.js">` |
-| - | `<link rel="stylesheet" href="./assets/index-BkwjA9HK.css">` |
-
-### 2.4 构建命令
-
-在 [ui/package.json](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/package.json#L5-L8) 中定义：
-
-```json
-"scripts": {
-    "dev": "vite",                              // 开发模式，热重载
-    "build": "dprint fmt && vite build"         // 生产构建，输出到 dist/
-}
-```
-
-执行 `npm run build` 后，输出目录结构：
+执行 `npm run build` 后输出到 `ui/dist/`，其中所有文件都会被 Go embed 嵌入，最终走 **路径 A（Static 嵌入静态服务）**：
 
 ```
-ui/dist/
-├── index.html              # SPA 入口
-├── assets/                 # 打包后的 JS/CSS（带 content hash）
+ui/dist/                          ← 被 //go:embed all:dist 整体嵌入
+├── index.html                    ← 路径 A
+├── assets/                       ← 路径 A（Vite 打包产物，带 content hash）
 │   ├── index-V68uRsWE.js
 │   ├── index-BkwjA9HK.css
 │   └── ...（按路由拆分的 chunk）
-├── fonts/                  # 字体文件
-├── images/                 # 图标、Logo、OAuth2 提供商图标
-└── libs/                   # 第三方库（TinyMCE、uPlot、Prism、Shablon）
+├── fonts/                        ← 路径 A
+├── images/                       ← 路径 A
+└── libs/                         ← 路径 A（TinyMCE、uPlot、Prism、Shablon）
 ```
+
+**注意：`/_/extensions.js` 不在 dist 目录中，它是运行时动态生成的，走路径 C。**
 
 ---
 
-## 三、阶段 2：Go Embed 编译时嵌入
+## 三、阶段 2：Go Embed 编译时嵌入（仅路径 A）
 
 ### 3.1 核心嵌入逻辑
 
-嵌入由 [ui/embed.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed.go) 实现：
+[ui/embed.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed.go)：
 
 ```go
 //go:build !no_ui
-
 package ui
 
 import (
@@ -137,447 +135,67 @@ var distDir embed.FS
 var DistDirFS, _ = fs.Sub(distDir, "dist")
 ```
 
-**关键技术点解析**：
+**关键技术点**：
 
-1. **`//go:embed all:dist` 指令**：
-   - `all:` 前缀确保 dist 目录下的所有文件（包括以 `_` 或 `.` 开头的文件）都被嵌入
-   - Go 编译器在编译时读取 `ui/dist/` 目录内容，序列化进二进制
-   - 必须导入 `embed` 包才能使用该指令
-
-2. **`fs.Sub(distDir, "dist")` 的作用**：
-   - 假设文件实际路径是 `dist/index.html`，在 `embed.FS` 中访问需要使用 `distDir.Open("dist/index.html")`
-   - 通过 `fs.Sub` 创建一个子文件系统视图，使得 `DistDirFS.Open("index.html")` 即可访问
-   - 简化后续 HTTP 处理器的路径映射
-
-3. **构建标签 `//go:build !no_ui`**：
-   - 默认构建（`go build`）时使用此文件，UI 被嵌入
-   - 使用 `go build -tags no_ui` 时跳过此文件，改用 [ui/embed_no_ui.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed_no_ui.go)
-
-### 3.2 无 UI 构建模式
-
-[ui/embed_no_ui.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed_no_ui.go)：
-
-```go
-//go:build no_ui
-
-package ui
-
-import "io/fs"
-
-// DistDirFS is deliberately not set to prevent bundling the UI with the binary.
-var DistDirFS fs.FS     // 值为 nil
-```
-
-通过 `ui.DistDirFS == nil` 判断即可在运行时检测 UI 是否可用。
+1. **`//go:embed all:dist`**：Go 编译器在编译时读取 `ui/dist/` 目录内容，序列化进二进制。`all:` 前缀确保以 `_` 或 `.` 开头的文件也被嵌入。
+2. **`fs.Sub(distDir, "dist")`**：`distDir.Open("dist/index.html")` 经 `fs.Sub` 包装后，调用方只需 `DistDirFS.Open("index.html")`。
+3. **构建标签 `!no_ui`**：`go build` 默认嵌入；`go build -tags no_ui` 时使用 [ui/embed_no_ui.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed_no_ui.go)（`DistDirFS = nil`）。
 
 ---
 
-## 四、阶段 3：Hash 路由机制（前端）
+## 四、阶段 3：前端 Hash 路由机制
 
 ### 4.1 为什么使用 Hash 路由
 
-PocketBase Admin UI 使用 Hash 路由（如 `/_/#/collections`）而不是 History API 路由（如 `/_/collections`），原因在于：
+- **Hash 部分 `#/...` 不发送到服务器**：访问 `/_/#/collections`，浏览器实际只请求 `GET /_/`
+- 前端 JS 读取 `window.location.hash` 渲染页面
+- **服务端无需 SPA fallback**：`indexFallback = false`
 
-- **Hash 部分 `#/...` 不会发送到服务器**——浏览器只发送 `/_/`，服务器始终返回同一个 `index.html`
-- 前端 JS 通过监听 `hashchange` 事件，读取 `window.location.hash` 来决定渲染哪个页面
-- **服务端无需实现 SPA fallback**——`indexFallback = false` 即可，简化了静态服务逻辑
+### 4.2 前端路由定义
 
-### 4.2 前端路由实现
-
-路由定义在 [ui/src/router.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/router.js#L117-L174)：
+[ui/src/router.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/router.js#L117-L174)，所有路由均以 `#/` 开头：
 
 ```js
-const routeDefs = {};
-
-// 注册路由（全部以 #/ 开头）
 app.routes.guestOnly("#/login", pageSuperuserLogin);
-app.routes.guestOnly("#/pbinstall/{token}", pageInstaller);
 app.routes.superuserOnly("#/collections", pageCollections);
 app.routes.superuserOnly("#/settings", pageApplicationSettings);
-app.routes.superuserOnly("#/settings/sql", pageSQLConsole);
-// ... 等等
-
-export function initRouter() {
-    destroyRouter = router(routeDefs, { fallbackPath: app.routes.fallbackPath });
-}
-// fallbackPath = "#/collections"（默认跳到集合列表页）
+// ...
+// fallbackPath = "#/collections"（hash 为空时默认跳转）
 ```
 
-页面初始化流程在 [ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js#L127-L147)：
+### 4.3 前端加载流程（关键：动态加载 extensions.js）
 
-1. 动态加载 `/_/extensions.js`（UI 扩展合并脚本）
-2. 加载完成后 `app.store._ready = true`
-3. watch 触发后调用 `initRouter()`
-4. Shablon 的 `router()` 读取 `window.location.hash`，匹配路由定义并渲染页面
-5. 如果 hash 为空或不匹配，fallback 到 `#/collections`
+[ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js#L127-L147)：
 
-### 4.3 API 路径构建
-
-在 [ui/src/pb.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/pb.js#L9-L14) 中初始化 PocketBase JS SDK：
-
-```js
-window.app.pb = new PocketBase(
-    import.meta.env.PB_BACKEND_URL,   // 生产环境为 "../"
-    new LocalAuthStore("__pb_superusers__" + currentPath),
-);
+```
+1. 页面基础脚本执行完毕
+2. await import(app.pb.buildURL("/_/extensions.js"))
+   ↑ 请求 GET /_/extensions.js，走路径 C（动态合并处理器）
+3. app.store._ready = true
+4. initRouter() → 读 window.location.hash → 渲染对应页面
 ```
 
-SDK 的 `buildURL()` 方法会把 `../` 作为 base，结合 `/_/` 页面路径：
-- `buildURL("/api/collections")` → 解析为 `/api/collections`（向上跳出 `/_/` 目录）
-- `buildURL("/_/extensions.js")`（见 [main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js#L137-L139)）→ 解析为 `/_/extensions.js`
+**也就是说，路径 C（扩展动态脚本）是前端页面加载流程的一部分，在路由初始化之前执行。**
 
 ---
 
-## 五、阶段 4：HTTP 路由注册与访问场景详解
+## 五、阶段 4：HTTP 路由注册时序
 
-### 5.1 路由注册入口
-
-在 [apis/serve.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/serve.go#L83-L99) 的 `Serve()` 函数中：
-
-```go
-if ui.DistDirFS != nil {
-    pbRouter.GET("/_/{path...}", Static(ui.DistDirFS, false)).
-        //                                       ↑ 注意：indexFallback = false
-        BindFunc(func(e *core.RequestEvent) error {
-            // 缓存控制：非开发模式、非根路径时设置 14 天缓存
-            if !e.App.IsDev() &&
-                e.Request.PathValue(StaticWildcardParam) != "" &&
-                //                                    ↑ path 非空才缓存
-                e.Response.Header().Get("Cache-Control") == "" {
-                e.Response.Header().Set("Cache-Control", "max-age=1209600, stale-while-revalidate=86400")
-            }
-
-            if e.Response.Header().Get("Content-Security-Policy") == "" {
-                e.Response.Header().Set("Content-Security-Policy", defaultCSP)
-            }
-
-            return e.Next()
-        }).
-        Bind(Gzip())
-}
-```
-
-**路由设计要点**：
-
-| 项目 | 值 | 说明 |
-|------|----|------|
-| 路径 | `/_/{path...}` | Admin UI 挂载在 `/_/` 前缀下，与 API 路径 `/api/*` 分离 |
-| 处理器 | `Static(ui.DistDirFS, false)` | 通用静态文件服务 |
-| **indexFallback** | **`false`** | **不启用 SPA 路由 fallback**——因为前端使用 hash 路由 |
-| 中间件 | 缓存控制 + CSP + Gzip | 生产环境非根路径资源缓存 14 天，启用 Gzip 压缩 |
-
-### 5.2 URL 访问场景全景分析
-
-路由模式 `GET /_/{path...}` 中的 `{path...}` 是 Go 1.22+ 的通配符语法，匹配 `/_/` 之后的所有路径段。通过 `e.Request.PathValue("path")` 取出匹配值。
-
-以下是各种访问场景的完整分析：
-
----
-
-#### ✅ 场景 A：正确访问——Hash 路由 `/_/#/collections`
+三条路径的注册时机不同，这决定了它们的路由匹配优先级：
 
 ```
-用户输入: http://127.0.0.1:8090/_/#/collections
-```
-
-| 步骤 | 发生了什么 | 代码位置 |
-|------|-----------|---------|
-| A1 | 浏览器发起请求：**`GET /_/`**（`#/collections` 是 hash，不会发送） | 浏览器行为 |
-| A2 | Go `http.ServeMux` 匹配路由 `/_/{path...}`，`PathValue("path") = ""` | 标准库 |
-| A3 | Static 处理器：`filename = filepath.Clean("") = ""` | [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L124) |
-| A4 | `fs.Stat(fsys, "")` → 根目录存在，`fi.IsDir() = true` | |
-| A5 | URL `/_/` 已以 `/` 结尾，不触发重定向 | [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L146-L148) |
-| A6 | `e.FileFS(fsys, "")` → 目录自动拼接 `index.html`，发送文件 | [tools/router/event.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/tools/router/event.go#L250-L262) |
-| A7 | 缓存中间件：`path == ""` → **不设置** Cache-Control（HTML 不缓存） | [apis/serve.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/serve.go#L86-L91) |
-| A8 | 浏览器收到 index.html，解析 `<script src="./assets/...">` | |
-| A9 | 相对路径 `./assets/index-xxx.js` → 请求 `GET /_/assets/index-xxx.js` | 浏览器行为 |
-| A10 | 前端 JS 读取 `window.location.hash = "#/collections"`，渲染集合列表页 | [ui/src/router.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/router.js) |
-
-**结果：200 OK ✅，页面正常渲染**
-
----
-
-#### ✅ 场景 B：正确访问——根路径 `/_/` 或 `/_`
-
-```
-用户输入: http://127.0.0.1:8090/_/   (末尾带斜杠)
-用户输入: http://127.0.0.1:8090/_    (末尾不带斜杠)
-```
-
-| URL | 行为 |
-|-----|------|
-| `/_/` | 同场景 A，直接返回 index.html，前端 hash fallback 到 `#/collections` |
-| `/_` | Go `http.ServeMux` 匹配 `/_/{path...}`，`path=""`，`fi.IsDir()=true`，URL 不以 `/` 结尾 → **301 重定向到 `/_/`**，然后同上 |
-
----
-
-#### ✅ 场景 C：正确访问——静态资源 `/_/assets/index-V68uRsWE.js`
-
-```
-浏览器自动请求: GET /_/assets/index-V68uRsWE.js
-```
-
-| 步骤 | 发生了什么 |
-|------|-----------|
-| C1 | `PathValue("path") = "assets/index-V68uRsWE.js"` |
-| C2 | `filename = filepath.Clean("assets/index-V68uRsWE.js")` = `"assets/index-V68uRsWE.js"` |
-| C3 | `fs.Stat(fsys, "assets/index-V68uRsWE.js")` → 存在，`fi.IsDir() = false` |
-| C4 | URL 不以 `/` 结尾，不以 `index.html` 结尾 → 不重定向 |
-| C5 | `e.FileFS(fsys, "assets/index-V68uRsWE.js")` → 直接发送文件 |
-| C6 | 缓存中间件：`path != ""` 且非 dev → 设置 `Cache-Control: max-age=1209600...`（14 天）|
-
-**结果：200 OK ✅，带强缓存**
-
-同理，`/_/fonts/...`、`/_/images/...`、`/_/libs/...`、`/_/extensions.js` 都属于这类。
-
----
-
-#### ✅ 场景 D：规范化重定向——`/_/index.html`
-
-```
-用户输入: http://127.0.0.1:8090/_/index.html
-```
-
-| 步骤 | 发生了什么 |
-|------|-----------|
-| D1 | `path = "index.html"` |
-| D2 | `fs.Stat(fsys, "index.html")` → 存在，是文件 |
-| D3 | URL 以 `index.html` 结尾 → **301 重定向到 `/_/`** |
-| D4 | 浏览器请求 `/_/`，回到场景 B |
-
-**结果：301 → 200 OK ✅**
-
----
-
-#### ❌ 场景 E：404 错误——非 Hash 路径直连 `/_/collections`
-
-```
-用户直接输入或刷新: http://127.0.0.1:8090/_/collections
-```
-
-这是最容易混淆的场景。由于前端使用 hash 路由，**这个路径在服务端根本不存在对应的文件或目录**。
-
-| 步骤 | 发生了什么 | 代码位置 |
-|------|-----------|---------|
-| E1 | `path = "collections"` | |
-| E2 | `filename = filepath.Clean("collections")` = `"collections"` | [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L124) |
-| E3 | `fs.Stat(fsys, "collections")` → **文件不存在**，返回 err | [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L136) |
-| E4 | `indexFallback == false` && `filename != "index.html"` → **不 fallback** | [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L137-L142) |
-| E5 | 直接返回 `router.ErrFileNotFound` → HTTP **404** | |
-
-**结果：404 Not Found ❌**
-
-**用户需要访问的正确 URL 是 `/_/#/collections`（带 #）**。
-
----
-
-#### ❌ 场景 F：404 错误——`/_/collections/`（末尾带斜杠）
-
-```
-用户输入: http://127.0.0.1:8090/_/collections/
-```
-
-| 步骤 | 发生了什么 |
-|------|-----------|
-| F1 | `path = "collections/"` |
-| F2 | `filename = filepath.Clean("collections/")` = `"collections"`（Clean 去掉末尾斜杠）|
-| F3 | `fs.Stat(fsys, "collections")` → **不存在** |
-| F4 | `indexFallback == false` → 返回 404 |
-
-**结果：404 Not Found ❌**
-
----
-
-#### ❌ 场景 G：404 错误——不存在的资源
-
-```
-GET /_/assets/nonexist.js
-GET /_/nonexist
-GET /_/nonexist/
-```
-
-都因 `fs.Stat()` 失败且 `indexFallback=false` 返回 404。
-
----
-
-### 5.3 访问场景汇总表
-
-| 用户访问 URL | path 值 | filename | fs.Stat 结果 | 行为 | HTTP 状态 |
-|-------------|---------|----------|-------------|------|----------|
-| `/_/` | `""` | `""` | 根目录 ✓ | 目录 → index.html | 200 |
-| `/_` | `""` | `""` | 根目录 ✓ | 301 重定向到 `/_/` | 301 |
-| `/_/#/collections` | `""` | `""` | 根目录 ✓ | 返回 index.html，前端渲染 | 200 |
-| `/_/#/settings/sql` | `""` | `""` | 根目录 ✓ | 返回 index.html，前端渲染 | 200 |
-| `/_/index.html` | `"index.html"` | `"index.html"` | 文件 ✓ | 301 重定向到 `/_/` | 301 |
-| `/_/assets/index-V68uRsWE.js` | `"assets/index-V68uRsWE.js"` | 同上 | 文件 ✓ | 直接返回，带 14 天缓存 | 200 |
-| `/_/libs/tinymce/tinymce.min.js` | `"libs/tinymce/tinymce.min.js"` | 同上 | 文件 ✓ | 直接返回，带缓存 | 200 |
-| `/_/extensions.js` | `"extensions.js"` | `"extensions.js"` | 文件 ✓（扩展脚本） | 直接返回 | 200 |
-| **`/_/collections`** | `"collections"` | `"collections"` | **不存在** | **indexFallback=false → 404** | **404 ❌** |
-| **`/_/settings`** | `"settings"` | `"settings"` | **不存在** | **indexFallback=false → 404** | **404 ❌** |
-| `/_/collections/` | `"collections/"` | `"collections"` | **不存在** | indexFallback=false → 404 | 404 ❌ |
-| `/_/assets/notexist.js` | `"assets/notexist.js"` | 同上 | **不存在** | 404 | 404 ❌ |
-
----
-
-## 六、阶段 5：Static 静态文件处理器详解
-
-### 6.1 Static 函数完整实现
-
-[apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L93-L171)：
-
-```go
-func Static(fsys fs.FS, indexFallback bool) func(*core.RequestEvent) error {
-    if fsys == nil {
-        panic("Static: the provided fs.FS argument is nil")
-    }
-
-    return func(e *core.RequestEvent) error {
-        // 1. 跳过成功访问日志（避免刷屏）
-        if e.Get(requestEventKeySkipSuccessActivityLog) == nil {
-            e.Set(requestEventKeySkipSuccessActivityLog, true)
-        }
-
-        // 2. 提取并规范化路径
-        filename := e.Request.PathValue(StaticWildcardParam)  // "path"
-        filename = filepath.ToSlash(filepath.Clean(strings.TrimPrefix(filename, "/")))
-
-        // 3. 目录穿越防护（防御性检查，标准 fs 通常已处理）
-        if len(filename) > 2 && filename[0] == '.' && filename[1] == '.' && (filename[2] == '/' || filename[2] == '\\') {
-            if indexFallback && filename != router.IndexPage {
-                return e.FileFS(fsys, router.IndexPage)
-            }
-            return router.ErrFileNotFound
-        }
-
-        // 4. 检查文件/目录是否存在
-        fi, err := fs.Stat(fsys, filename)
-        if err != nil {
-            if indexFallback && filename != router.IndexPage {
-                return e.FileFS(fsys, router.IndexPage)
-            }
-            return router.ErrFileNotFound
-        }
-
-        // 5. URL 规范化重定向
-        if fi.IsDir() {
-            if !strings.HasSuffix(e.Request.URL.Path, "/") {
-                // 目录：确保以 / 结尾 → /test -> /test/
-                return e.Redirect(http.StatusMovedPermanently, safeRedirectPath(e.Request.URL.Path+"/"))
-            }
-        } else {
-            urlPath := e.Request.URL.Path
-            if strings.HasSuffix(urlPath, "/") {
-                // 文件但以 / 结尾 → 去掉尾部斜杠
-                urlPath = strings.TrimRight(urlPath, "/")
-                return e.Redirect(http.StatusMovedPermanently, safeRedirectPath(urlPath))
-            } else if stripped, ok := strings.CutSuffix(urlPath, router.IndexPage); ok {
-                // 显式 index.html → 重定向到目录
-                return e.Redirect(http.StatusMovedPermanently, safeRedirectPath(stripped))
-            }
-        }
-
-        // 6. 实际发送文件
-        fileErr := e.FileFS(fsys, filename)
-
-        // 7. SPA fallback（仅当 indexFallback=true 时；Admin UI 中此分支永远不触发）
-        if fileErr != nil && indexFallback && filename != router.IndexPage && errors.Is(fileErr, router.ErrFileNotFound) {
-            return e.FileFS(fsys, router.IndexPage)
-        }
-
-        return fileErr
-    }
-}
-```
-
-### 6.2 重定向规则汇总
-
-| 请求路径 | 文件/目录类型 | 行为 | 示例 |
-|----------|--------------|------|------|
-| `/test`（无尾斜杠） | 目录 | 301 → `/test/` | `/_/assets` → `/_/assets/`（如果 assets 是目录） |
-| `/test/`（有尾斜杠） | 文件 | 301 → `/test` | `/_/index.js/` → `/_/index.js` |
-| `/test/index.html` | 文件 | 301 → `/test/` | `/_/index.html` → `/_/` |
-
-### 6.3 FileFS 文件发送实现
-
-最终由 [tools/router/event.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/tools/router/event.go#L234-L272) 的 `FileFS()` 完成文件输出：
-
-```go
-func (e *Event) FileFS(fsys fs.FS, filename string) error {
-    f, err := fsys.Open(filename)
-    if err != nil {
-        return ErrFileNotFound
-    }
-    defer f.Close()
-
-    fi, err := f.Stat()
-    if err != nil {
-        return err
-    }
-
-    // 如果是目录，自动拼接 index.html
-    if fi.IsDir() {
-        filename = filepath.ToSlash(filepath.Join(filename, IndexPage))
-        f, err = fsys.Open(filename)
-        // ...（错误处理与重新 Stat）
-    }
-
-    // 文件必须实现 io.ReadSeeker（embed.FS 返回的文件满足此要求）
-    ff, ok := f.(io.ReadSeeker)
-    if !ok {
-        return errors.New("[FileFS] file does not implement io.ReadSeeker")
-    }
-
-    // 使用标准库的 ServeContent，自动处理：
-    //   - Content-Type 推断（基于扩展名）
-    //   - Range 请求（断点续传）
-    //   - Last-Modified / If-Modified-Since（协商缓存）
-    http.ServeContent(e.Response, e.Request, fi.Name(), fi.ModTime(), ff)
-
-    return nil
-}
-```
-
----
-
-## 七、阶段 6：首次启动的 Installer 机制
-
-当系统中尚无超级用户时，PocketBase 会自动引导创建首个管理员。
-
-在 [apis/installer.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/installer.go) 中：
-
-1. **判断是否需要安装程序**：`needInstallerSuperuser()` 检查超级用户表是否为空
-2. **创建临时 installer 用户**：`findOrCreateInstallerSuperuser()` 创建一个邮箱为 `__pocketbase_installer@local.dev` 的临时超管
-3. **生成 30 分钟 token** 并打开浏览器访问 `/_/#/pbinstall/{token}`（使用 hash 路由）
-4. **前端路由匹配**：[ui/src/auth/pageInstaller.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/auth/pageInstaller.js) 处理 `#/pbinstall/{token}` hash 路由，用户创建真正的管理员后临时账户被清理
-
-注意 Installer URL 使用的是 `/_/#/pbinstall/{token}`（hash 路由）而非 `/_/pbinstall/{token}`，避免 404。
-
----
-
-## 八、阶段 7：UI 扩展机制（动态路径）
-
-PocketBase 支持在运行时通过插件注入额外的 UI 资源，由 [apis/extensions.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go) 实现。
-
-与嵌入的 dist 静态资源不同，扩展路由有两条完全不同的处理链路：
-- **动态合并脚本** `/_/extensions.js`：每次请求动态拼接所有扩展的 main.js
-- **扩展自有静态资源** `/_/extensions/{name}/{path...}`：每个扩展独立的 Static 路由
-
-### 8.1 路由注册时序（关键：OnServe Hook）
-
-扩展路由**不是**在 `NewRouter()` 时立即注册，而是通过绑定 OnServe Hook 延迟到服务启动时注册。完整时序：
-
-```
-[cmd/serve.go → Serve()]
+[called: Serve()]
    │
    ├── 1. NewRouter(app)
    │       │
    │       └── bindUIExtensions(app)
    │             │
    │             └── app.OnServe().Bind({Priority: 9999, Func: ...})
-   │                    ↑ 仅仅是绑定 Hook，并不真正注册路由
+   │                    ↑ 仅仅绑定 Hook，不立即注册路由
    │
    ├── 2. pbRouter.GET("/_/{path...}", Static(ui.DistDirFS, false))
-   │       ↑ 在 OnServe 之前先注册 dist 的通配符路由
+   │       ↑ 注册路径 A（嵌入打包静态资源）
+   │         在 OnServe 触发之前
    │
    └── 3. app.OnServe().Trigger(serveEvent, func(e) {
              │
@@ -585,52 +203,153 @@ PocketBase 支持在运行时通过插件注入额外的 UI 资源，由 [apis/e
              │       │
              │       └── bindUIExtensions 的 Func 被调用
              │             │
-             │             ├── uiGroup = se.Router.Group("/_")
-             │             │       ↑ 创建 /_ 子路由组
+             │             ├── uiGroup = se.Router.Group("/_").Bind(缓存+CSP+Gzip)
              │             │
              │             ├── for ext in UIExtensions:
              │             │     uiGroup.GET("/extensions/"+ext.Name+"/{path...}", Static(ext.FS, false))
+             │             │     ↑ 注册路径 B（各扩展自有静态资源）
              │             │
              │             └── uiGroup.GET("/extensions.js", 匿名处理器)
+             │                   ↑ 注册路径 C（动态合并扩展入口脚本）
              │
              └── e.Router.BuildMux()
-                   ↑ 此时所有路由（含扩展）都已注册，编译为最终 http.ServeMux
+                   ↑ 所有路由（A+B+C）此时全部编译为最终 http.ServeMux
          })
 ```
 
-由于 Go 1.22+ `http.ServeMux` 的"最具体匹配优先"规则：
-- `/_/extensions.js`（精确路径）优先于 `/_/{path...}`（通配符）匹配
-- `/_/extensions/ext1/{path...}`（更具体前缀）优先于 `/_/{path...}` 匹配
+**Go 1.22+ ServeMux 路由优先级（最具体匹配优先）**：
 
-### 8.2 扩展资源路由（Static 处理器）
+| 模式 | 匹配范围 | 优先级 |
+|------|---------|--------|
+| `GET /_/extensions.js`（路径 C） | 精确匹配一个文件 | **最高** |
+| `GET /_/extensions/ext1/{path...}`（路径 B） | 特定扩展名的子路径 | **中** |
+| `GET /_/{path...}`（路径 A） | `/_/` 下所有其他路径 | **最低** |
 
-每个扩展通过 `Static(ext.FS, false)` 注册独立静态路由：
+因此：
+- 请求 `/_/extensions.js` 一定命中路径 C，不会被路径 A 捕获
+- 请求 `/_/extensions/ext1/test.txt` 一定命中路径 B
+- 请求 `/_/assets/a.js`、`/_/libs/...`、`/_/index.html` 等命中路径 A
+
+---
+
+## 六、阶段 5：统一访问场景表
+
+以下是所有 `/_/` 前缀下 URL 的完整访问场景，**每条都明确标注命中哪条路径及完整代码调用链**：
+
+| # | URL | 命中路径 | PathValue("path") | 完整代码执行链路 | HTTP 状态 |
+|---|-----|---------|-------------------|-----------------|----------|
+| A1 | `/_/#/collections` | **A** | `""`（hash 不发服务器） | `Static(ui.DistDirFS,false)`：`filename=""` → `fs.Stat`→根目录 → `FileFS` 拼 `index.html` → `http.ServeContent` | 200 |
+| A2 | `/_/` | **A** | `""` | 同 A1 | 200 |
+| A3 | `/_` | **A** | `""` | `Static`：`fi.IsDir=true`、URL 不以 `/` 结尾 → **301 重定向到 `/_/`** | 301 |
+| A4 | `/_/index.html` | **A** | `"index.html"` | `Static`：`fs.Stat`→文件存在 → URL 以 `index.html` 结尾 → **301 重定向到 `/_/`** | 301 |
+| A5 | `/_/assets/index-V68uRsWE.js` | **A** | `"assets/index-V68uRsWE.js"` | `Static`：`fs.Stat`→文件存在 → `FileFS` → `http.ServeContent`。中间件设 `Cache-Control: max-age=1209600`（path≠空） | 200 |
+| A6 | `/_/libs/tinymce/tinymce.min.js` | **A** | `"libs/tinymce/tinymce.min.js"` | 同 A5（lib 也是 dist 嵌入文件） | 200 |
+| A7 | `/_/fonts/roboto.woff2` | **A** | `"fonts/roboto.woff2"` | 同 A5 | 200 |
+| A8 | `/_/images/logo.png` | **A** | `"images/logo.png"` | 同 A5 | 200 |
+| A9 | `/_/collections`（非 hash ❌） | **A** | `"collections"` | `Static`：`fs.Stat(ui.DistDirFS,"collections")`→**不存在** → `indexFallback=false` → 返回 `ErrFileNotFound` | **404** |
+| A10 | `/_/settings`（非 hash ❌） | **A** | `"settings"` | 同 A9 | **404** |
+| A11 | `/_/assets/notexist.js` | **A** | `"assets/notexist.js"` | `fs.Stat`→不存在 → `indexFallback=false` → 404 | 404 |
+| **C1** | **`/_/extensions.js`** | **C** | N/A（精确匹配） | 匿名处理器：`buf := new(bytes.Buffer)` → `for ext in UIExtensions: copyExtensionMainjs(buf, ext)`（逐个 `ext.FS.Open("main.js")` → 用 `await (async function(){...})();` 包裹 → `io.Copy` 到 buf） → `re.Stream(200, "text/javascript", buf)` | 200 |
+| C2 | `/_/extensions.js`（无扩展） | **C** | N/A | 同 C1，但循环体无内容 → 返回空 Buffer（Content-Length: 0） | 200 |
+| C3 | `/_/extensions.js`（`no_ui` 构建） | 无路由 | N/A | `ui.DistDirFS=nil` → `bindUIExtensions` 直接 return → 路径 C 未注册 → 回退到路径 A → `fs.Stat("extensions.js")` 不存在 → 404 | 404 |
+| B1 | `/_/extensions/ext1/test.txt`（ext1 存在） | **B** | `"test.txt"`（在 ext1 组内） | `Static(ext1.FS, false)`：`fs.Stat(ext1.FS,"test.txt")`→存在 → `FileFS` → `http.ServeContent` | 200 |
+| B2 | `/_/extensions/ext1/missing.txt`（ext1 存在） | **B** | `"missing.txt"` | `Static(ext1.FS, false)`：`fs.Stat`→不存在 → `indexFallback=false` → 404 | 404 |
+| B3 | `/_/extensions/ext1/test.txt`（无任何扩展） | 无路由→回退 **A** | `"extensions/ext1/test.txt"` | 路径 B 未注册 → 命中路径 A → `fs.Stat(ui.DistDirFS, "extensions/ext1/test.txt")` → dist 中不存在 → 404 | 404 |
+| B4 | `/_/extensions/ext2%20with%20spaces/a.css` | **B** | `"a.css"` | URL 解码后扩展名 "ext2 with spaces" 匹配 → `Static(ext.FS,false)` 正常处理 | 200 |
+
+---
+
+## 七、阶段 6：路径 A（嵌入静态服务）代码调用链
+
+### 7.1 路由注册
+
+[apis/serve.go:83-99](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/serve.go#L83-L99)：
 
 ```go
-// apis/extensions.go:42-49
-for _, ext := range se.UIExtensions {
-    if ext.Name == "" || ext.FS == nil {
-        se.App.Logger().Debug("Invalid UI extension configuration", slog.Any("extension", ext))
-        continue
-    }
-    // 路径模式：/_/extensions/{name}/{path...}
-    // 文件来源：ext.FS（运行时由插件提供的 fs.FS，非 Go embed）
-    uiGroup.GET("/extensions/"+ext.Name+"/{path...}", Static(ext.FS, false))
+if ui.DistDirFS != nil {
+    pbRouter.GET("/_/{path...}", Static(ui.DistDirFS, false)).
+        //                                       ↑ indexFallback = false
+        BindFunc(func(e *core.RequestEvent) error {
+            // path != ""（非 index.html）才设置 14 天强缓存
+            if !e.App.IsDev() &&
+                e.Request.PathValue(StaticWildcardParam) != "" &&
+                e.Response.Header().Get("Cache-Control") == "" {
+                e.Response.Header().Set("Cache-Control", "max-age=1209600, stale-while-revalidate=86400")
+            }
+            if e.Response.Header().Get("Content-Security-Policy") == "" {
+                e.Response.Header().Set("Content-Security-Policy", defaultCSP)
+            }
+            return e.Next()
+        }).
+        Bind(Gzip())
 }
 ```
 
-**与 dist 静态资源的异同**：
-- 相同点：都使用 `Static()` 处理器，都有 `indexFallback=false`，都走 `fs.Stat → e.FileFS → http.ServeContent`
-- 不同点：
-  - dist 资源使用 `ui.DistDirFS`（编译时 embed），扩展资源使用 `ext.FS`（运行时注入，可以是任意 fs.FS 实现）
-  - dist 路由模式 `/_/{path...}`，扩展路由模式 `/_/extensions/{name}/{path...}`（多一层 name 命名空间）
+### 7.2 Static 处理器完整执行流程
 
-### 8.3 动态合并脚本 `/_/extensions.js`（非 Static 处理器！）
+[apis/base.go:93-171](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L93-L171)：
 
-这是与 dist 静态资源**完全不同**的处理链路——不走 `Static()`，而是一个独立的匿名处理器：
+```
+Static(ui.DistDirFS, false) 返回闭包 → 被 http.ServeMux 调用
+    │
+    ├── 1. e.Set(requestEventKeySkipSuccessActivityLog, true)
+    │       跳过成功访问日志
+    │
+    ├── 2. filename = filepath.Clean(PathValue("path"))
+    │
+    ├── 3. 目录穿越防护（防御性检查）
+    │
+    ├── 4. fi, err := fs.Stat(ui.DistDirFS, filename)
+    │       │
+    │       ├── err != nil（文件不存在）：
+    │       │     indexFallback=false → 直接返回 ErrFileNotFound（404）
+    │       │
+    │       └── err == nil：
+    │             │
+    │             ├── fi.IsDir()：
+    │             │     ├── URL 不以 "/" 结尾 → 301 重定向到 URL+"/"
+    │             │     └── 已以 "/" 结尾 → 继续（不重定向）
+    │             │
+    │             └── !fi.IsDir()（是文件）：
+    │                   ├── URL 以 "/" 结尾 → 301 去掉尾斜杠
+    │                   └── URL 以 "index.html" 结尾 → 301 重定向到父目录
+    │
+    └── 5. fileErr := e.FileFS(ui.DistDirFS, filename)
+            │
+            └── 见 FileFS 调用链（下一节）
+```
+
+### 7.3 FileFS 文件发送（路径 A/B 共用）
+
+[tools/router/event.go:234-272](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/tools/router/event.go#L234-L272)：
+
+```
+e.FileFS(fsys, filename)
+    │
+    ├── f := fsys.Open(filename)
+    │
+    ├── fi.IsDir() == true：
+    │     filename = filepath.Join(filename, "index.html")
+    │     重新 fsys.Open(filename)
+    │
+    ├── ff := f.(io.ReadSeeker)   // embed.FS 返回的文件满足此接口
+    │
+    └── http.ServeContent(Response, Request, fi.Name(), fi.ModTime(), ff)
+          ↑ 标准库自动处理：
+              - Content-Type 推断（扩展名）
+              - Range 请求（断点续传）
+              - Last-Modified / If-Modified-Since（协商缓存）
+```
+
+---
+
+## 八、阶段 7：路径 C（动态合并扩展脚本）代码调用链
+
+### 8.1 路由注册
+
+[apis/extensions.go:52-66](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go#L52-L66)：
 
 ```go
-// apis/extensions.go:52-66
 uiGroup.GET("/extensions.js", func(re *core.RequestEvent) error {
     buf := new(bytes.Buffer)
 
@@ -639,7 +358,7 @@ uiGroup.GET("/extensions.js", func(re *core.RequestEvent) error {
     for _, ext := range se.UIExtensions {
         err := copyExtensionMainjs(buf, ext)
         if err != nil {
-            return re.InternalServerError("An error occurred while generating the main.js extension file", err)
+            return re.InternalServerError("...", err)
         }
     }
 
@@ -647,232 +366,251 @@ uiGroup.GET("/extensions.js", func(re *core.RequestEvent) error {
 }).Bind(SkipSuccessActivityLog())
 ```
 
-### 8.4 `copyExtensionMainjs` 合并策略
+### 8.2 copyExtensionMainjs 合并逻辑
 
 [apis/extensions.go:72-95](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go#L72-L95)：
 
-```go
-func copyExtensionMainjs(buf *bytes.Buffer, ext core.UIExtension) error {
-    f, err := ext.FS.Open("main.js")
-    if err != nil {
-        if errors.Is(err, os.ErrNotExist) {
-            return nil // 扩展没有 main.js 就跳过，不报错
-        }
-        return fmt.Errorf("[UI extension %q] main.js open error: %w", ext.Name, err)
-    }
-    defer f.Close()
-
-    // 每个扩展的 main.js 被独立的 async IIFE 包裹，避免作用域冲突
-    // await/async 用于支持扩展使用顶层 await
-    _, _ = buf.WriteString("await (async function(){")
-    _, err = io.Copy(buf, f)
-    _, _ = buf.WriteString("})();")
-
-    return err
-}
+```
+copyExtensionMainjs(buf, ext)
+    │
+    ├── f, err := ext.FS.Open("main.js")
+    │     │
+    │     ├── os.ErrNotExist：return nil（跳过，不报错）
+    │     └── 其他错误：return error
+    │
+    ├── buf.WriteString("await (async function(){")
+    │     ↑ IIFE 包裹，隔离各扩展作用域
+    │
+    ├── io.Copy(buf, f)
+    │     ↑ 将扩展 main.js 原样拷贝到 Buffer
+    │
+    └── buf.WriteString("})();")
+          ↑ await 用于支持扩展内顶层 await
 ```
 
-合并后的响应内容示例（来自测试 [apis/extensions_test.go:75](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions_test.go#L75)）：
+### 8.3 合并后响应示例
+
+来自测试 [apis/extensions_test.go:75](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions_test.go#L75)：
 
 ```js
 await (async function(){ext1_main})();await (async function(){ext3_main})();
 ```
 
-### 8.5 前端加载时机
+### 8.4 路径 C 与路径 A 的 12 项差异
 
-[ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js#L137-L147)：
-
-```js
-try {
-    await import(app.pb.buildURL("/_/extensions.js"));
-    //   ↑ 动态 import 加载合并后的扩展脚本
-} catch (_) {}
-
-// 扩展加载完成后，标记 store 就绪，触发路由初始化
-app.store._ready = true;
-```
-
----
-
-## 九、阶段 8：嵌入静态资源 vs 动态扩展脚本——处理路径对比
-
-### 9.1 三条资源处理链路总览
-
-Admin UI 挂载在 `/_/` 下，但实际有三条不同的处理链路：
-
-| 链路 | 典型 URL | 处理器 | 文件来源 | 注册时机 | 注册位置 |
-|------|---------|--------|---------|---------|---------|
-| **A. 嵌入 dist 静态资源** | `/_/assets/...`<br>`/_/libs/...`<br>`/_/index.html` | `Static(ui.DistDirFS, false)` | Go embed 编译时嵌入 `ui/dist/` | Serve() 中（OnServe 之前） | [apis/serve.go:83](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/serve.go#L83) |
-| **B. 扩展静态资源** | `/_/extensions/ext1/test.txt` | `Static(ext.FS, false)` | 运行时注入的 `ext.FS`（每个扩展独立） | OnServe Hook（Priority 9999） | [apis/extensions.go:48](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go#L48) |
-| **C. 动态合并脚本** | `/_/extensions.js` | **匿名函数**（非 Static！） | 运行时遍历所有扩展，逐个读 `main.js` 动态拼接 | OnServe Hook（Priority 9999） | [apis/extensions.go:54-65](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go#L54-L65) |
-
-### 9.2 链路 A vs 链路 C：逐行代码对比
-
-| 对比维度 | 链路 A：`/_/assets/index-xxx.js` | 链路 C：`/_/extensions.js` |
+| 对比维度 | 路径 A：`/_/assets/index-xxx.js` | 路径 C：`/_/extensions.js` |
 |---------|-------------------------------|--------------------------|
-| **路由模式** | `GET /_/{path...}`（通配符） | `GET /_/extensions.js`（精确匹配） |
-| **处理器函数** | `Static(ui.DistDirFS, false)` 返回的闭包 | 内联匿名函数 `func(re *core.RequestEvent) error {...}` |
-| **文件存在性检查** | `fs.Stat(fsys, "assets/index-xxx.js")` —— 精确查找文件 | 无检查——直接创建空 Buffer，逐个扩展尝试打开 main.js |
-| **文件读取方式** | `fsys.Open(filename)` 一次性打开 | 循环中 `ext.FS.Open("main.js")` 每个扩展各打开一次 |
-| **目录处理** | 目录自动拼接 `index.html` | 不涉及目录概念（始终输出一个合并后的 JS 文件） |
-| **重定向逻辑** | 检查是否以 `/` 结尾、是否为 `index.html`，必要时 301 | 无重定向 |
-| **SPA Fallback** | `indexFallback=false` → 404 | 不适用 |
-| **内容发送方式** | `e.FileFS()` → `http.ServeContent()`（支持 Range、协商缓存、Content-Type 推断） | `re.Stream(200, "text/javascript", buf)`（直接输出 Buffer，Content-Type 固定） |
-| **内存缓存** | 文件在编译时嵌入二进制（随程序启动常驻内存） | **每次请求重新读取并合并**（注释明确 "don't cache in memory to allow previewing changes without restart"） |
-| **成功日志** | Static 内部 `e.Set(requestEventKeySkipSuccessActivityLog, true)` | 显式 `.Bind(SkipSuccessActivityLog())` |
-| **缓存头中间件** | 路由级别：`path != ""` 才设置 Cache-Control | 组级别 uiGroup：无条件设置 Cache-Control（非 dev 时） |
-
-### 9.3 扩展相关 URL 访问场景表
-
-| URL | path 通配符匹配 | 命中链路 | 行为 | HTTP 状态 |
-|-----|----------------|---------|------|----------|
-| `/_/extensions.js` | N/A（精确匹配优先） | 链路 C | 遍历所有扩展，动态合并 main.js，以 text/javascript 输出 | 200 |
-| `/_/extensions.js`（无扩展） | N/A | 链路 C | 返回空 Buffer（Content-Length: 0） | 200 |
-| `/_/extensions.js`（`ui.DistDirFS=nil`，即 no_ui） | N/A | 无路由注册 → 404 | bindUIExtensions 直接 return | 404 |
-| `/_/extensions/ext1/test.txt`（ext1 存在） | path="test.txt"（在 ext1 组内） | 链路 B | `Static(ext1.FS, false)` → 查 ext1.FS 中的 "test.txt" → 存在则发送 | 200 |
-| `/_/extensions/ext1/test.txt`（无任何扩展） | N/A | 无路由注册 → 回退到链路 A | 链路 A path="extensions/ext1/test.txt" → fs.Stat 不存在 → 404 | 404 |
-| `/_/extensions/ext1/missing.txt`（ext1 存在） | path="missing.txt" | 链路 B | `fs.Stat(ext1.FS, "missing.txt")` 不存在 → indexFallback=false → 404 | 404 |
-| `/_/extensions/ext2%20with%20spaces/test.txt` | path="test.txt" | 链路 B | 扩展名 "ext2 with spaces" 经 URL 解码后匹配 → Static 正常处理 | 200 |
+| 路由模式 | `GET /_/{path...}`（通配符） | `GET /_/extensions.js`（精确匹配） |
+| 处理器 | `Static(ui.DistDirFS, false)` 返回的闭包 | 内联匿名函数 |
+| 文件存在性检查 | `fs.Stat(fsys, "assets/index-xxx.js")` —— 精确查找 | 无文件存在性检查；扩展无 main.js 则跳过 |
+| 文件读取 | `ui.DistDirFS.Open(filename)` 一次打开 | 循环 N 次 `ext.FS.Open("main.js")`（每个扩展各一次） |
+| 目录处理 | 目录自动拼接 `index.html` | 不涉及目录概念 |
+| 重定向逻辑 | 检查是否以 `/` 结尾、是否含 `index.html`，必要时 301 | 无重定向 |
+| SPA Fallback | `indexFallback=false` → 404 | 不适用 |
+| 内容发送方式 | `e.FileFS()` → `http.ServeContent()`（支持 Range、协商缓存、Content-Type 推断） | `re.Stream(200, "text/javascript", buf)`（固定 Content-Type，不支持 Range） |
+| 内存缓存 | 文件在编译时嵌入二进制，常驻内存 | **每次请求重新读取并合并**（注释明确 "don't cache in memory to allow previewing changes without restart"） |
+| 成功日志跳过 | Static 内部 `e.Set(requestEventKeySkipSuccessActivityLog, true)` | 显式 `.Bind(SkipSuccessActivityLog())` |
+| 缓存头中间件 | 路由级别：仅 `path != ""` 时设置 Cache-Control | 组级别 uiGroup：无条件设置 Cache-Control（非 dev） |
+| Gzip 中间件 | 绑定在路径 A 路由上 | 绑定在 uiGroup 上（路径 C 继承） |
 
 ---
 
-## 十、阶段 9：完整时序图
+## 九、阶段 8：路径 B（扩展自有静态资源）代码调用链
 
-### 10.1 时序图 A：`/_/#/collections` 页面加载（含 extensions.js）
+### 9.1 路由注册
+
+[apis/extensions.go:42-49](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go#L42-L49)：
+
+```go
+for _, ext := range se.UIExtensions {
+    if ext.Name == "" || ext.FS == nil {
+        continue
+    }
+    // 路径模式：/_/extensions/{name}/{path...}
+    // 文件系统：ext.FS（运行时注入，非 embed）
+    uiGroup.GET("/extensions/"+ext.Name+"/{path...}", Static(ext.FS, false))
+}
+```
+
+### 9.2 与路径 A 的异同
+
+| 项目 | 路径 A（嵌入打包静态） | 路径 B（扩展自有静态） |
+|------|---------------------|---------------------|
+| Static 处理器 | ✓ 相同 | ✓ 相同 |
+| indexFallback | false | false |
+| FileFS → http.ServeContent | ✓ 相同 | ✓ 相同 |
+| fs.FS 来源 | `ui.DistDirFS`（编译时 embed） | `ext.FS`（运行时注入任意 fs.FS） |
+| 路由模式 | `/_/{path...}` | `/_/extensions/{name}/{path...}`（多一层命名空间） |
+| 缓存头中间件 | 路由级（path≠空才设） | uiGroup 级（无条件） |
+
+---
+
+## 十、完整调用时序图
+
+### 10.1 时序图 A：`/_/#/collections` 页面完整加载（路径 A + 路径 C）
 
 ```
-用户在浏览器输入 http://127.0.0.1:8090/_/#/collections
+用户输入: http://127.0.0.1:8090/_/#/collections
         │
-        │  hash 不发服务器
+        │  hash 部分 #/collections 不发送到服务器
         ▼
 [HTTP 1] GET /_/
         │
-        ├─ 匹配路由 A: GET /_/{path...}
+        ├─ Go ServeMux 匹配：无更具体路由 → 命中路径 A
+        │   模式: GET /_/{path...}
         │   PathValue("path") = ""
         │
-        ├─ 链路 A：Static(ui.DistDirFS, false)
-        │   ├── filename = ""
-        │   ├── fs.Stat → 根目录
-        │   └── FileFS → 拼接 index.html → http.ServeContent
+        ├─ [路径 A] Static(ui.DistDirFS, false) 执行：
+        │   ├── filename = filepath.Clean("") = ""
+        │   ├── fs.Stat(ui.DistDirFS, "") → fi.IsDir() = true
+        │   ├── URL "/_/" 已以 "/" 结尾 → 不重定向
+        │   └── e.FileFS(ui.DistDirFS, "")
+        │         ├── fsys.Open("") → 打开根目录
+        │         ├── fi.IsDir() → 拼接 index.html
+        │         ├── fsys.Open("index.html") → 成功
+        │         └── http.ServeContent(...) → 发送 HTML
         │
-        │   响应头：无 Cache-Control（path 为空），有 CSP
-        │   响应体：index.html
+        │   响应头：无 Cache-Control（path=""），有 CSP + Gzip
+        │   响应体：index.html（200 OK）
         ▼
-浏览器收到 index.html，解析资源引用
-        │
-        ├── <script src="./assets/index-V68uRsWE.js">
-        │       → 解析为 GET /_/assets/index-V68uRsWE.js
+浏览器解析 index.html，发现以下资源引用：
         │
         ├── <script src="./libs/shablon/shablon.iife.js">
-        │       → 解析为 GET /_/libs/shablon/shablon.iife.js
+        │       → 相对路径解析为 GET /_/libs/shablon/shablon.iife.js
+        │
+        ├── <script type="module" src="./assets/index-V68uRsWE.js">
+        │       → 相对路径解析为 GET /_/assets/index-V68uRsWE.js
         │
         └── <link rel="stylesheet" href="./assets/index-BkwjA9HK.css">
-                → 解析为 GET /_/assets/index-BkwjA9HK.css
+                → 相对路径解析为 GET /_/assets/index-BkwjA9HK.css
         │
         ▼
-[HTTP 2~N] GET /_/assets/index-V68uRsWE.js 等资源请求
+[HTTP 2~N] GET /_/assets/index-V68uRsWE.js 等（全部走路径 A）
         │
-        ├─ 仍匹配链路 A：GET /_/{path...}
-        │   PathValue("path") = "assets/index-V68uRsWE.js"
+        ├─ 全部命中路径 A：GET /_/{path...}
+        │   例如 PathValue("path") = "assets/index-V68uRsWE.js"
         │
-        ├─ Static 处理：
-        │   ├── fs.Stat(fsys, "assets/index-V68uRsWE.js") → 存在
-        │   └── FileFS → http.ServeContent
+        ├─ [路径 A] Static 执行：
+        │   ├── filename = "assets/index-V68uRsWE.js"
+        │   ├── fs.Stat(ui.DistDirFS, filename) → 存在（文件）
+        │   ├── URL 不以 "/" 结尾，不以 "index.html" 结尾 → 不重定向
+        │   └── e.FileFS(ui.DistDirFS, filename)
+        │         └── http.ServeContent(...) → 发送文件
         │
-        │   响应头：Cache-Control: max-age=1209600（path 非空）
+        │   响应头：Cache-Control: max-age=1209600（path≠空），CSP，Gzip
         ▼
 浏览器执行 JS，main.js 启动
         │
-        └── 动态 import: await import(app.pb.buildURL("/_/extensions.js"))
+        └── await import(app.pb.buildURL("/_/extensions.js"))
                 → GET /_/extensions.js
         │
         ▼
-[HTTP N+1] GET /_/extensions.js
+[HTTP N+1] GET /_/extensions.js（走路径 C）
         │
-        ├─ 精确匹配优先 → 命中链路 C（非 Static！）
+        ├─ Go ServeMux 匹配：精确模式 GET /_/extensions.js 优先
+        │   （不命中路径 A 的通配符）
         │
-        ├─ 动态处理器执行：
-        │   ├── buf = new(bytes.Buffer)
-        │   ├── for ext in [ext1, ext2, ...]:
-        │   │     ├── copyExtensionMainjs(buf, ext)
-        │   │     │   ├── ext.FS.Open("main.js")
-        │   │     │   ├── buf.WriteString("await (async function(){")
-        │   │     │   ├── io.Copy(buf, f)
-        │   │     │   └── buf.WriteString("})();")
-        │   │     └── （不存在 main.js 则跳过）
+        ├─ [路径 C] 匿名处理器执行：
+        │   ├── buf := new(bytes.Buffer)
+        │   ├── SkipSuccessActivityLog 已绑定
+        │   │
+        │   ├── for _, ext := range se.UIExtensions:
+        │   │     └── copyExtensionMainjs(buf, ext):
+        │   │           ├── ext.FS.Open("main.js")
+        │   │           │     ├── 不存在 → skip（return nil）
+        │   │           │     └── 存在 → 继续
+        │   │           ├── buf.WriteString("await (async function(){")
+        │   │           ├── io.Copy(buf, f)   ← 拷贝扩展 main.js 内容
+        │   │           └── buf.WriteString("})();")
+        │   │
         │   └── re.Stream(200, "text/javascript", buf)
         │
-        │   响应头：uiGroup 中间件设置 Cache-Control（非 dev）
+        │   响应头：uiGroup 中间件设 Cache-Control（非 dev）、CSP、Gzip
         │   响应体：await (async function(){ext1_main})();await (async function(){ext3_main})();
         ▼
-扩展脚本执行完成
+扩展脚本执行完毕
         │
         ├── app.store._ready = true
         ├── initRouter() 被调用
         ├── window.location.hash = "#/collections"
-        └── Shablon router 渲染集合列表页 ✓
+        └── Shablon router 匹配 "#/collections" → 渲染集合列表页 ✓
 ```
 
-### 10.2 时序图 B：`/_/extensions/ext1/test.txt` 扩展静态资源
+### 10.2 时序图 B：`/_/extensions/ext1/test.txt`（路径 B）
 
 ```
 GET /_/extensions/ext1/test.txt
         │
-        ├─ 路由匹配：
-        │   模式1: GET /_/extensions/ext1/{path...}（链路 B，更具体 → 优先）
-        │   模式2: GET /_/{path...}（链路 A，被跳过）
+        ├─ Go ServeMux 匹配（最具体优先）：
+        │   模式 1: GET /_/extensions/ext1/{path...}（路径 B）→ 优先 ✓
+        │   模式 2: GET /_/{path...}（路径 A）→ 被跳过
         │
         │   PathValue("path") = "test.txt"
         │
-        ├─ 链路 B：Static(ext1.FS, false)
-        │   ├── filename = "test.txt"
-        │   ├── fs.Stat(ext1.FS, "test.txt") → 存在
-        │   └── FileFS → http.ServeContent
+        ├─ [路径 B] Static(ext1.FS, false) 执行：
+        │   ├── filename = filepath.Clean("test.txt") = "test.txt"
+        │   ├── fs.Stat(ext1.FS, "test.txt") → 存在（文件）
+        │   ├── 不重定向
+        │   └── e.FileFS(ext1.FS, "test.txt")
+        │         └── http.ServeContent(...) → 发送 ext1 的 test.txt
         │
-        │   响应头：uiGroup 中间件设置 Cache-Control + CSP
-        │   响应体：ext1/test.txt 的内容（如 "ext1_txt"）
+        │   响应头：uiGroup 中间件设 Cache-Control、CSP、Gzip
+        │   响应体：ext1_txt（200 OK）
         ▼
 200 OK ✓
 ```
 
-### 10.3 时序图 C：`/_/collections`（非 hash，404 场景）
+### 10.3 时序图 C：`/_/collections` 非 hash 直连（路径 A → 404）
 
 ```
-GET /_/collections（注意：没有 #）
+GET /_/collections（注意：没有 #，是错误 URL）
         │
-        ├─ 路由匹配：
-        │   无更具体模式 → 命中链路 A：GET /_/{path...}
+        ├─ Go ServeMux 匹配：无更具体路由 → 命中路径 A
+        │   模式: GET /_/{path...}
         │   PathValue("path") = "collections"
         │
-        ├─ 链路 A：Static(ui.DistDirFS, false)
-        │   ├── filename = "collections"
-        │   ├── fs.Stat(ui.DistDirFS, "collections") → 不存在
-        │   ├── indexFallback == false → 不回退到 index.html
+        ├─ [路径 A] Static(ui.DistDirFS, false) 执行：
+        │   ├── filename = filepath.Clean("collections") = "collections"
+        │   ├── fs.Stat(ui.DistDirFS, "collections") → err != nil（不存在该文件/目录）
+        │   ├── indexFallback == false → ★ 不回退到 index.html
         │   └── return router.ErrFileNotFound
         │
         ▼
 404 Not Found ❌
-（用户应访问 /_/#/collections，hash 路由由前端处理）
+正确的 URL 应该是 /_/#/collections（带 #），由前端 hash 路由处理
 ```
 
 ---
 
-## 十一、关键文件索引
+## 十一、首次启动 Installer 机制
+
+当系统中尚无超级用户时，PocketBase 会自动引导创建首个管理员（[apis/installer.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/installer.go)）：
+
+1. `needInstallerSuperuser()` 检查超级用户表是否为空
+2. 创建临时 installer 用户（邮箱 `__pocketbase_installer@local.dev`）
+3. 生成 30 分钟 token，打开浏览器访问 **`/_/#/pbinstall/{token}`（hash 路由，避免 404）**
+4. 前端 [ui/src/auth/pageInstaller.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/auth/pageInstaller.js) 处理 `#/pbinstall/{token}` hash 路由
+5. 用户创建真正管理员后，临时账户被清理
+
+---
+
+## 十二、关键文件索引
 
 | 文件 | 职责 |
 |------|------|
-| [ui/embed.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed.go) | Go embed 嵌入 dist 目录 |
-| [ui/embed_no_ui.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed_no_ui.go) | no_ui 标签下的空实现 |
+| [ui/embed.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed.go) | Go embed 嵌入 dist 目录（路径 A 的文件来源） |
+| [ui/embed_no_ui.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/embed_no_ui.go) | no_ui 标签下的空实现（路径 B/C 也不注册） |
 | [ui/vite.config.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/vite.config.js) | Vite 构建配置（`base: "./"` 相对路径） |
 | [ui/.env](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/.env) | 生产环境变量（`PB_BACKEND_URL = "../"`） |
 | [ui/package.json](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/package.json) | npm build/dev 脚本 |
-| [ui/src/router.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/router.js) | 前端 hash 路由定义 |
-| [ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js) | 前端入口，加载扩展，初始化路由 |
-| [ui/src/pb.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/pb.js) | JS SDK 初始化（使用相对路径 `PB_BACKEND_URL`） |
-| [apis/serve.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/serve.go) | 注册 `/_/{path...}` 路由与缓存/CSP/Gzip 中间件 |
-| [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L93-L171) | `Static()` 静态文件处理器（含 `indexFallback=false`） |
-| [tools/router/event.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/tools/router/event.go#L234-L272) | `FileFS()` 实际发送文件（目录自动转 index.html） |
-| [apis/extensions.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go) | UI 扩展资源路由与 main.js 合并 |
+| [ui/src/router.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/router.js) | 前端 hash 路由定义（全部 #/ 开头） |
+| [ui/src/main.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/main.js) | 前端入口，动态 import `/_/extensions.js`（触发路径 C），初始化路由 |
+| [ui/src/pb.js](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/ui/src/pb.js) | JS SDK 初始化（使用 `PB_BACKEND_URL` 相对路径） |
+| [apis/serve.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/serve.go#L83-L99) | 注册路径 A：`/_/{path...}` 路由与缓存/CSP/Gzip 中间件 |
+| [apis/base.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/base.go#L93-L171) | `Static()` 静态文件处理器（路径 A 和 B 共用，含 `indexFallback=false`） |
+| [apis/extensions.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions.go) | 注册路径 B（扩展静态）和路径 C（动态合并 `extensions.js`） |
+| [tools/router/event.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/tools/router/event.go#L234-L272) | `FileFS()` 实际发送文件（路径 A/B 共用，目录自动转 index.html，调用 http.ServeContent） |
 | [apis/installer.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/installer.go) | 首次启动 Installer 引导流程（使用 hash 路由 URL） |
+| [apis/extensions_test.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/apis/extensions_test.go) | 路径 B/C 的测试用例（含合并结果断言） |
 | [cmd/serve.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/cmd/serve.go) | serve CLI 命令入口 |
 | [pocketbase.go](file:///d:/fz/0601/solo-dogfeeding/code/162-pocketbase/pocketbase.go) | PocketBase 入口，注册 serve 命令 |
