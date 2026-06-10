@@ -294,15 +294,104 @@ if !m.IsNew() && m.ignoreUnchangedFields {
 
 空值判断逻辑在各字段的 `ValidateValue` 中实现，代码上**不直观**，以下按字段逐个对照源码核准：
 
-##### 1. 按字符串空值处理的字段
+##### 1. text / email / url / editor 类字段
 
-| 字段 | 空值判断 | 代码依据 |
-|-----|---------|---------|
-| text / email / url / editor | `val == ""` | [core/field_text.go#L184](core/field_text.go#L184)：`if val == "" { if f.Required { return validation.ErrRequired } return nil }` |
-| relation / select / file 单选 | 归一化为 `""` 后判空 | 见各字段 `normalizeValue`，单选 nil → `""` |
-| relation / select / file 多选 | `len(ids) == 0` | [core/field_relation.go#L204](core/field_relation.go#L204)：`len(ids)==0 && f.Required → ErrRequired` |
+`TextField` 的 `ValidateValue` 不直接做空值判断，它只做类型断言和主键校验，然后委托给 `ValidatePlainValue`：
 
-##### 2. 不按字符串空值处理的字段（重点）
+```go
+// core/field_text.go L179-L220
+func (f *TextField) ValidateValue(...) error {
+    newVal, ok := record.GetRaw(f.Name).(string)  // L180 类型断言
+    if !ok { return validators.ErrUnsupportedValueType }
+    if f.PrimaryKey { /* PK 变更检查 + 查重，L185-L216 */ }
+    return f.ValidatePlainValue(newVal)            // L219 委托
+}
+```
+
+真正的 Required 空值判断在 `ValidatePlainValue` 中，用 `validation.Required.Validate(value)`（由 go-ozzo 库提供，空字符串返回 ErrRequired）：
+
+```go
+// core/field_text.go L223-L232
+func (f *TextField) ValidatePlainValue(value string) error {
+    if f.Required || f.PrimaryKey {
+        if err := validation.Required.Validate(value); err != nil { // L225
+            return err
+        }
+    }
+    if value == "" {     // L230：非 Required 时，空字符串直接跳过后续校验
+        return nil
+    }
+    // ... Min/Max/Pattern 等后续校验
+}
+```
+
+代码依据：
+- `ValidateValue` 入口：[core/field_text.go#L179-L220](core/field_text.go#L179-L220)
+- Required 空值判断：[core/field_text.go#L223-L232](core/field_text.go#L223-L232)
+
+---
+
+##### 2. relation / select / file —— 归一化后按 `len(slice) == 0` 判空
+
+这三个字段的空值判断模式完全相同：先把原始值归一化为字符串切片，再判断切片长度是否为 0。
+
+**RelationField**：
+
+```go
+// core/field_relation.go L198-L205
+func (f *RelationField) ValidateValue(...) error {
+    ids := list.ToUniqueStringSlice(record.GetRaw(f.Name))  // L199：归一化 + 去重
+    if len(ids) == 0 {
+        if f.Required {
+            return validation.ErrRequired   // L202
+        }
+        return nil // L204：非 Required 时空值直接通过
+    }
+    // ... MinSelect / MaxSelect / 关联存在性检查
+}
+```
+
+代码依据：[core/field_relation.go#L198-L205](core/field_relation.go#L198-L205)
+
+**SelectField**（模式完全相同）：
+
+```go
+// core/field_select.go L185-L192
+func (f *SelectField) ValidateValue(...) error {
+    normalizedVal := list.ToUniqueStringSlice(record.GetRaw(f.Name)) // L186
+    if len(normalizedVal) == 0 {
+        if f.Required {
+            return validation.ErrRequired  // L189
+        }
+        return nil // L191
+    }
+    // ... MaxSelect / Values 白名单检查
+}
+```
+
+代码依据：[core/field_select.go#L185-L192](core/field_select.go#L185-L192)
+
+**FileField**（模式完全相同）：
+
+```go
+// core/field_file.go L241-L248
+func (f *FileField) ValidateValue(...) error {
+    files := f.toSliceValue(record.GetRaw(f.Name))  // L242：归一化为切片（包含字符串和 *filesystem.File）
+    if len(files) == 0 {
+        if f.Required {
+            return validation.ErrRequired  // L245
+        }
+        return nil // L247
+    }
+    // ... 防混淆检查 / MaxSelect / 上传文件校验
+}
+```
+
+代码依据：[core/field_file.go#L241-L248](core/field_file.go#L241-L248)
+
+关于"单选"：单选虽然在 DB 中存储为 `""`，但 `ValidateValue` 里统一走 `ToUniqueStringSlice` / `toSliceValue` 归一化为切片后判断 `len==0`，所以单选和多选的判空逻辑一致。
+
+##### 3. 不按字符串空值处理的字段（重点）
 
 ###### (a) DateField —— 用 `types.DateTime.IsZero()` 判断空值
 
@@ -383,13 +472,85 @@ if val.Lat == 0 && val.Lon == 0 {   // Null Island
 - 注意：经纬度 (0, 0) 是真实存在的地理坐标（几内亚湾的 Null Island），但在 PocketBase 语义上被当作空值
 - ColumnType 是 `JSON DEFAULT '{"lon":0,"lat":0}' NOT NULL`
 
-##### 3. 其他非字符串空值的字段
+##### 4. number / bool / password —— 非字符串空值字段
 
-| 字段 | 空值判断 | 代码依据 |
-|-----|---------|---------|
-| number | `val == 0` | [core/field_number.go#L164](core/field_number.go#L164)：`if val == 0 { if f.Required { return validation.ErrRequired } return nil }` |
-| bool | `val == false` | [core/field_bool.go#L119](core/field_bool.go#L119)：`if !val && f.Required { return validation.ErrRequired }`（Required 时必须为 true） |
-| password | `fp.Hash == ""` | [core/field_password.go#L173](core/field_password.go#L173)：`if f.Required && fp.Hash == "" { return validation.ErrRequired }`（仅校验 Hash，不校验 Plain） |
+这三个字段的内部值类型都不是字符串，空值判断各有特点：
+
+**(a) NumberField —— `val == 0` 判空**
+
+```go
+// core/field_number.go L134-L151
+func (f *NumberField) ValidateValue(...) error {
+    val, ok := record.GetRaw(f.Name).(float64)  // L135：内部类型是 float64
+    if !ok { return validators.ErrUnsupportedValueType }
+    if math.IsInf(val, 0) || math.IsNaN(val) { /* L140-L142 Inf/NaN 检查 */ }
+
+    if val == 0 {                       // L144：零值判空
+        if f.Required {
+            if err := validation.Required.Validate(val); err != nil { // L146
+                return err
+            }
+        }
+        return nil // L150：非 Required 时 0 直接跳过后续校验
+    }
+    // ... OnlyInt / Min / Max 检查
+}
+```
+
+代码依据：[core/field_number.go#L134-L151](core/field_number.go#L134-L151)
+
+注意：Required 分支调用了 `validation.Required.Validate(val)`，对 float64 的 `0` go-ozzo 会返回 ErrRequired，效果等同于直接判断。非 Required 时 `val == 0` 直接 return nil，Min/Max 等约束对 0 值完全不生效。
+
+---
+
+**(b) BoolField —— Required 时必须为 true**
+
+```go
+// core/field_bool.go L109-L120
+func (f *BoolField) ValidateValue(...) error {
+    v, ok := record.GetRaw(f.Name).(bool)  // L110：内部类型是 bool
+    if !ok { return validators.ErrUnsupportedValueType }
+
+    if f.Required {
+        return validation.Required.Validate(v)  // L116：true 通过，false 返回 ErrRequired
+    }
+    return nil
+}
+```
+
+代码依据：[core/field_bool.go#L109-L120](core/field_bool.go#L109-L120)
+
+注意：BoolField 的"空值"不是显式判断 `v == false`，而是通过 go-ozzo 的 `validation.Required`。对 bool 类型，false 被视为空值返回 ErrRequired，所以 Required=true 时字段必须勾选为 true。
+
+---
+
+**(c) PasswordField —— 按 `fp.Hash` 是否为空判空**
+
+```go
+// core/field_password.go L164-L182
+func (f *PasswordField) ValidateValue(...) error {
+    fp, ok := record.GetRaw(f.Name).(*PasswordFieldValue)  // L165：内部类型是结构体指针
+    if !ok { return validators.ErrUnsupportedValueType }
+    if fp.LastError != nil { return fp.LastError }         // L170-L172：bcrypt 哈希失败
+
+    if f.Required {
+        if err := validation.Required.Validate(fp.Hash); err != nil { // L175：校验 Hash，不校验 Plain
+            return err
+        }
+    }
+    if fp.Plain == "" {     // L180：Plain 为空直接跳过长度/Pattern 校验
+        return nil
+    }
+    // ... Plain 的 Min/Max/Pattern 检查
+}
+```
+
+代码依据：[core/field_password.go#L164-L182](core/field_password.go#L164-L182)
+
+关键点：
+- Required 只校验 `fp.Hash`（bcrypt 哈希），不校验 `fp.Plain`（明文）
+- `fp.Plain == ""` 时直接 return nil，长度和 Pattern 校验完全不生效（因为只有在修改密码时 Plain 才非空）
+- Hash 的 setter 在 `FindSetter` 中立即 bcrypt 哈希后同时填充 Hash 和 Plain
 
 ### 5.2 RelationField 关联校验
 
