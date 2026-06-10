@@ -291,56 +291,83 @@ _, err := search.FilterData(vStr).BuildExpr(r)
 | 引用了集合不存在的字段 | `nonexistent_field = "x"` | `Invalid rule. Raw error: unknown field ...` |
 | 系统集合改规则 | `_superusers` 改 MFA.Rule | `System collection API rule cannot be changed.` |
 
-**保存时放行、但认证时会爆雷的无效规则**：
+**保存时就会被拦截的无效规则**：
+
+| 类型 | 例子 | 报错环节 |
+|------|------|----------|
+| 语法错误（括号不匹配） | `(role = "admin"` | `BuildExpr` |
+| 语法错误（非法运算符） | `role + "admin"` | `BuildExpr` |
+| 字段名不符合白名单正则 | `@invalid.field = "x"` | `BuildExpr` → runner 正则校验 |
+| 引用了集合不存在的字段 | `nonexistent_field = "x"` | `BuildExpr` → `processActiveProps` |
+| **`@collection.xxx` 引用不存在的集合** | `@collection.nonexistent.id != null` | `BuildExpr` → `processCollectionField` → `loadCollection` |
+| 系统集合改规则 | `_superusers` 改 MFA.Rule | `ensureNoSystemRuleChange` |
+
+**保存时放行、但认证时才会爆雷的问题**：
 
 | 类型 | 例子 | 保存时为什么放过 |
 |------|------|------------------|
-| `@collection.xxx` 引用不存在的集合 | `@collection.nonexistent.id != null` | `BuildExpr` 只做格式校验（符合 `^\@collection\.\w+...$` 正则就行），不查该集合是否真的存在 |
-| 字段类型和比较值不匹配 | `email = 123`（字符串 vs 数字） | `BuildExpr` 不做类型检查，只要字段名合法就通过 |
-| `@request.body.*` 引用的字段运行时类型不兼容 | `@request.body.age > 18`（body.age 传的是字符串） | RequestInfo 是空的，`BuildExpr` 看不到真实值 |
-| 数据库层面异常（表损坏、连接失败等） | — | 根本没执行 SQL |
+| 字段类型和比较值不匹配（弱类型数据库行为） | `email = 123`（字符串 vs 数字） | `BuildExpr` 不做类型检查，只要字段名合法就通过；SQLite 是弱类型，只有碰到真实数据时才可能异常 |
+| `@request.body.*` 运行时值类型不兼容 | `@request.body.age > 18`（请求 body.age 传字符串 `"abc"`） | 保存时 `RequestInfo` 是空结构体，`@request.body.age` 解析为 `NULL`，`NULL > 18` 语法完全合法 |
+| `@collection.xxx` 引用的集合**保存后被删除** | 保存时集合存在，之后被人删掉 | 保存时 `loadCollection` 能找到，认证时再找就没了 |
+| `@collection.xxx.field` 引用的字段**保存后被删除** | 保存时字段存在，之后被改了 schema | 保存时字段存在，认证时再解析就找不到了 |
+| 数据库层面异常（表损坏、连接池耗尽等） | — | 保存阶段根本不执行真实 SQL |
 
 #### 阶段二：用户认证时的 `wantsMFA`
 入口：[record_helpers.go#L148-L183](file:///d:/fz/0601/solo-dogfeeding/code/157-pocketbase/apis/record_helpers.go#L148-L183)
 
 **触发条件**：`MFA.Enabled = true`（空规则直接返回 `(true, nil)`，全体走 MFA）
 
-**四个失败点**（任意一个出错都会导致所有用户 400）：
+**四个失败点（标注 MFA 规则场景下的真实可能性）**：
 ```go
 // 失败点 ①：提取请求上下文
 requestInfo, err := e.RequestInfo()
 if err != nil { return true, err }
+// → 理论上不会失败（框架填充），一旦失败是框架级异常
 
-// 失败点 ②：语法解析（和保存阶段相同）
+// 失败点 ②：语法解析 + @collection 集合存在性校验
 expr, err := search.FilterData(rule).BuildExpr(resolver)
 if err != nil { return true, err }
+// → 保存阶段已校验过语法、字段名、@collection 集合存在性
+// → 认证时在此处失败只有两种可能：
+//   a) 保存后有人删除了 @collection 引用的集合
+//   b) 手动改数据库写入了非法规则
 
-// 失败点 ③：处理 @collection 关联 JOIN（保存阶段没这步！）
+// 失败点 ③：处理 JOIN
 err = resolver.UpdateQuery(query)
 if err != nil { return true, err }
+// → ⚠️ MFA 规则场景下实际**不会失败**：
+//   wantsMFA 调用 NewRecordFieldResolver 时 allowHiddenFields=true
+//   → registerJoin 中不会执行 registerRuleJoin
+//   → listRuleJoins 永远为空，updateQueryWithCollectionListRule 永不执行
+//   → updateQueryWithDeduplicateConstraint 只做 query.Distinct(true)，无返回值
+//   结论：此处在 MFA 规则中永远不会触发 error
 
 // 失败点 ④：真实执行 SQL
 err = query.AndWhere(expr).Limit(1).Row(&exists)
 if err != nil && !errors.Is(err, sql.ErrNoRows) { return true, err }
+// → 唯一真正可能在认证时新暴露的失败点
 ```
 
-**什么情况才会登录失败**：
+**什么情况才会登录失败（排除手动改数据库的极端场景）**：
 
-只有**失败点 ③ 或 ④** 才是保存阶段放过、认证阶段才暴露的问题：
-- 失败点 ① `RequestInfo`：理论上不会失败（由框架填充），一旦失败通常是框架级异常
-- 失败点 ② `BuildExpr`：保存阶段已经校验过，除非有人手动改数据库写入非法规则，否则不会在这步失败
-- 失败点 ③ `UpdateQuery`：`@collection.xxx` 引用的集合被删除、或关联集合的 ListRule 执行失败 → 所有用户 400
-- 失败点 ④ SQL 执行：字段类型不匹配导致数据库报错、数据库表损坏、连接池耗尽等 → 所有用户 400
+只有**失败点 ④ SQL 执行异常**和**保存后 schema 被改动**才是保存阶段无法预见的运行时问题：
+- 字段类型不匹配触发数据库报错（如 `email = 123` 字符串 vs 数字，SQLite 弱类型行为取决于实际数据）
+- `@request.body.age > 18` 但请求 body.age 传了非数字字符串（保存时 RequestInfo 为空，解析为 NULL，语法合法；认证时真实值触发类型错误）
+- 保存后 `@collection.xxx` 引用的集合被删除（失败点 ②）
+- 保存后 `@collection.xxx.field` 引用的字段被删除（失败点 ②）
+- 数据库表损坏、连接池耗尽、磁盘满等环境异常
 
 #### 配置排障影响汇总
 
 | 现象 | 可能原因 | 排查方向 |
 |------|----------|----------|
-| 保存集合时提示 `Invalid rule` | 语法错误、字段名错误、系统集合改规则 | 检查括号、运算符、字段是否存在、是否为系统集合 |
-| 保存成功但所有用户登录都 400 `Failed to authenticate` | `@collection.xxx` 引用的集合不存在、字段类型不匹配、数据库异常 | 查日志找 `MFA rule failure:` 前缀；逐个检查 `@collection.*` 引用的集合是否存在；在数据库里手动执行 `SELECT 1 FROM users WHERE id='...' AND (你的规则)` 看是否报错 |
-| 保存成功但部分用户 400 | 规则对某些用户行触发类型错误（如 `age > 18` 但 age 对部分用户是 NULL 或字符串） | 检查字段类型一致性；用数据库测试用户行的实际值 |
-| 规则写了但对所有用户都不生效（都不需要 MFA） | 规则执行成功但对所有行返回 false（如 `1 = 0`） | 不属于失败，是规则逻辑本身写错 |
-| 规则写了但所有用户都要 MFA | 规则为空（默认全体），或规则对所有行返回 true | 检查 MFA.Rule 是否为空；用数据库验证逻辑 |
+| **保存集合时就报错** `Invalid rule. Raw error: ...` | 括号不匹配、非法运算符、字段名不符合白名单正则、引用了集合不存在的字段、**`@collection.xxx` 引用了不存在的集合** | 1. 检查括号、运算符语法<br>2. 确认字段在当前 auth 集合中真实存在<br>3. 用 `@collection.xxx` 时确认 xxx 集合确实已创建 |
+| **保存集合成功，但所有用户登录都 400** `Failed to authenticate` | ① 保存后 `@collection.xxx` 引用的集合/字段被删除<br>② 字段类型不匹配触发数据库报错（如 `email = 123`）<br>③ `@request.body.*` 值类型和比较值不兼容<br>④ 数据库环境异常（表损坏、连接池耗尽） | 1. 查日志找 `MFA rule failure:` 前缀的详细错误<br>2. 检查规则中所有 `@collection.*` 引用的集合/字段是否还存在<br>3. 在数据库手动执行：<br>`SELECT 1 FROM {auth_table} WHERE id='{某用户id}' AND ({你的规则})` 看是否 SQL 报错<br>4. 测试不同请求 body 类型是否触发问题 |
+| **保存集合成功，仅部分用户 400** | 规则对特定用户的行数据触发类型错误（如 `age > 18` 但某用户 age 存的是字符串 `"abc"`） | 对报 400 的用户 id 在数据库手动执行规则 SQL，看具体哪一行数据出问题；检查字段类型一致性 |
+| **规则写了但没人走 MFA**（所有用户都直接登录成功） | 规则执行成功但对所有行返回 false（如写了 `1 = 0`、字段值全不匹配条件） | 不属于失败，是规则逻辑写反了。在数据库手动执行规则 SQL，看 `exists` 是 0 还是 1 |
+| **规则写了但所有用户都要 MFA** | ① MFA.Rule 为空（默认全体强制）<br>② 规则对所有行返回 true（如 `1 = 1`） | 检查 MFA.Rule 是否为空字符串；在数据库验证规则逻辑的实际返回值 |
+
+> **排障核心技巧**：wantsMFA 执行的 SQL 等价于 `SELECT 1 FROM {auth_table} WHERE id=? AND ({规则}) LIMIT 1`。把 `?` 替换成真实用户 id，直接在 SQLite 里跑，能最快定位是语法问题、类型问题还是逻辑问题。
 
 ---
 
@@ -433,7 +460,9 @@ if err != nil && !errors.Is(err, sql.ErrNoRows) { return true, err }
 | **sentTo 写入时机** | 创建 OTP 时同步写入 `SetSentTo(email)` | 邮件 SMTP 发送成功后，在 `SendRecordOTP` Hook 里异步回填，值来自 `Message.To[0].Address` | 邮件发送慢/失败时 sentTo 为空 → OTP 登录后不会自动 verified；Hook 改收件地址会改变 sentTo |
 | **验证码长度生效** | 模糊描述"6~8 位" | 配置 `OTP.Length`（默认 8，最小 4）在生成时直接传给 `RandomStringWithAlphabet`；用户提交侧只限制 1~71 位不校验实际长度 | 改数据库能绕过最小 4 位限制；提交侧故意不校验长度以防枚举 |
 | **MFA 规则失败返回** | "视为需要 MFA，不跳过" | 返回 HTTP 400 `Failed to authenticate.`，**不创建 MFA 会话，不发 token**，硬拒绝所有该集合的登录 | 规则写错会在运行时阻断所有用户登录；客户端无法区分是密码错还是规则崩了 |
-| **MFA 规则两阶段校验** | "保存阶段不会报错" | 保存阶段 `checkRule` 只做语法/字段名格式校验（空 RequestInfo + 只调 BuildExpr）；`@collection` 引用不存在、字段类型不匹配、SQL 执行异常等运行时问题**保存阶段放行，认证阶段 wantsMFA 才暴露** | 保存成功不代表规则可用；上线前必须用真实用户登录验证；查日志看 `MFA rule failure:` 前缀定位问题 |
+| **MFA 规则两阶段校验** | "保存阶段不会报错" | 保存阶段 `checkRule`（空 RequestInfo + 只调 BuildExpr）能拦截语法错误、字段不存在、**`@collection.xxx` 引用不存在的集合**；只有字段类型不匹配、保存后 schema 改动、`@request.body.*` 值类型、数据库异常等才会到认证阶段 wantsMFA 才暴露 | 保存成功不代表规则可用；上线前用真实用户登录验证；查日志 `MFA rule failure:` 前缀；排障直接在 SQLite 跑 `SELECT 1 FROM {auth_table} WHERE id='...' AND ({规则})` |
+| **`@collection` 不存在的报错环节** | "保存时放过，UpdateQuery 才报错" | **保存阶段 BuildExpr 就报错**（`processCollectionField` → `loadCollection` 找不到集合直接 return error）；和字段名校验属于同一层级 | 保存时提示 `Invalid rule` 就检查 `@collection.*` 引用的集合是否已创建 |
+| **MFA 规则中 UpdateQuery** | "处理 @collection JOIN 时可能失败" | MFA 规则 `allowHiddenFields=true` → `registerJoin` 不执行 `registerRuleJoin` → `listRuleJoins` 为空 → `UpdateQuery` 中只有 `query.Distinct(true)`，**永远不会返回 error** | 不需要把 UpdateQuery 当作 MFA 规则的潜在失败点排查 |
 
 ---
 
