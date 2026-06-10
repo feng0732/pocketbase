@@ -443,9 +443,21 @@ PocketBase 存在 **两层** 模型钩子，但 Record 层并非简单的"在 Mo
 
 ### 6.3 代理桥接机制的精确结构
 
-Record 层钩子并非独立存在，而是通过 **系统内置 Handler** 桥接自 Model 层。参见 [record_model.go#L55-L350](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/record_model.go#L55-L350)。
+Record 层钩子并非独立存在，而是通过 **系统内置 Handler** 桥接自 Model 层。参见 [record_model.go#L55-L474](file:///d:/fz/0601/solo-dogfeeding/code/159-pocketbase/core/record_model.go#L55-L474)。
 
-所有 CRUD 相关的钩子对（5 个操作 × 每个操作 5 个阶段 = 25 对）都有相同的桥接模式。以 `OnModelCreate → OnRecordCreate` 为例：
+`registerRecordHooks()` 函数分为两段，每段各 13 个 Handler 注册：
+- **第一段（L56-L288）**：13 条 Model→Record 桥接 Handler，注册在 Model 层钩子上
+- **第二段（L292-L473）**：13 条 Record 层内部系统 Handler，注册在 Record 层钩子上
+
+13 条桥接注册的分布完全符合代码顺序：
+- Validate：单独 **1 条**
+- Create：覆盖 主流程 / Execute / AfterSuccess / AfterError，共 **4 条**
+- Update：覆盖 主流程 / Execute / AfterSuccess / AfterError，共 **4 条**
+- Delete：覆盖 主流程 / Execute / AfterSuccess / AfterError，共 **4 条**
+
+总计 1 + 4 + 4 + 4 = **13 条**桥接注册。
+
+以第一条桥接（`OnModelCreate → OnRecordCreate`，代码 L74-L90）为例：
 
 ```go
 // 系统桥接 Handler：注册在 Model 层，Priority=-99（最优先）
@@ -471,17 +483,33 @@ app.OnModelCreate().Bind(&hook.Handler[*ModelEvent]{
 
 **桥接的本质**：Record 层钩子链的 `oneOff` 处理函数就是 `me.Next()`，即回到 Model 层继续执行下一个 Handler。这样 Record 链和 Model 链被拼接成一个更大的洋葱。
 
-### 6.4 Record 层内部的系统 Handler
+### 6.4 Record 层内部的系统 Handler（13 条）
 
-除了 Model→Record 的桥接 Handler，Record 层钩子内部 **还注册了自己的系统 Handler**（ID 相同，都是 `__pbRecordSystemHook__`），负责调用字段拦截器或实际业务逻辑。不同阶段的 Priority 不同：
+除了 13 条 Model→Record 桥接 Handler，`registerRecordHooks()` 的 **第二段（L292-L473）** 在 Record 层钩子上还注册了 13 条同名 ID（`__pbRecordSystemHook__`）的内部系统 Handler，负责调用字段拦截器或实际业务逻辑。
 
-| Record 层钩子 | 系统 Handler Priority | 职责 |
-|---------------|----------------------|------|
-| `OnRecordCreate` | **-99**（最优先） | 调用 `callFieldInterceptors(InterceptorActionCreate, e.Next)`，即字段的 Create 拦截器先于用户 Handler |
-| `OnRecordValidate` | **99**（最低优先级/最内层） | 先执行用户 Handler，最后调用 `onRecordValidate()` 做实际字段验证 |
-| `OnRecordCreateExecute` | **99**（最内层） | 先执行用户 Handler，最后调用 `onRecordSaveExecute()` 做 Auth Token 刷新、唯一性检查、DB 错误规范化 |
-| `OnRecordAfterCreateSuccess` | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
-| `OnRecordAfterCreateError` | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+13 条 Record 内部 Handler 与桥接注册一一对应，分布完全相同：
+- Validate：单独 **1 条**
+- Create：主流程 / Execute / AfterSuccess / AfterError，共 **4 条**
+- Update：主流程 / Execute / AfterSuccess / AfterError，共 **4 条**
+- Delete：主流程 / Execute / AfterSuccess / AfterError，共 **4 条**
+
+不同阶段的 Priority 不同，决定了"用户 Handler 与系统逻辑谁先执行"：
+
+| Record 层钩子 | 所在代码行 | Priority | 职责 |
+|---------------|-----------|----------|------|
+| `OnRecordValidate` | L292 | **99**（最内层） | 先执行用户 Handler，最后调用 `onRecordValidate()` 做实际字段验证 |
+| `OnRecordCreate` | L307 | **-99**（最优先） | 先调用 `callFieldInterceptors(InterceptorActionCreate)`，再执行用户 Handler |
+| `OnRecordCreateExecute` | L320 | **99**（最内层） | 先执行用户 Handler，最后调用 `onRecordSaveExecute()` 做 Auth Token 刷新、唯一性检查、DB 错误规范化 |
+| `OnRecordAfterCreateSuccess` | L335 | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+| `OnRecordAfterCreateError` | L348 | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+| `OnRecordUpdate` | L361 | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+| `OnRecordUpdateExecute` | L374 | **99**（最内层） | 先执行用户 Handler，最后调用 `onRecordSaveExecute()` |
+| `OnRecordAfterUpdateSuccess` | L389 | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+| `OnRecordAfterUpdateError` | L402 | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+| `OnRecordDelete` | L415 | **-99**（最优先） | 先调用字段拦截器，再检查是否是 View（不能删除），再执行用户 Handler |
+| `OnRecordDeleteExecute` | L434 | **99**（最内层） | 先执行用户 Handler，最后调用 `onRecordDeleteExecute()` 处理级联删除 |
+| `OnRecordAfterDeleteSuccess` | L449 | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
+| `OnRecordAfterDeleteError` | L462 | **-99**（最优先） | 先调用字段拦截器，再执行用户 Handler |
 
 ### 6.5 真实触发顺序（以 Record 创建为例，修正版）
 
@@ -594,17 +622,27 @@ if saveErr != nil {
                     └─ Record 系统 Handler [Priority=-99] → 字段拦截器
 ```
 
-### 6.6 桥接模式总览
+### 6.6 桥接模式总览（13 条，完全对应代码顺序）
 
-所有 CRUD 阶段的桥接关系如下（5 个阶段 × 5 种操作 = 25 条独立的钩子对）：
+13 条桥接注册严格按照 `registerRecordHooks()` 的代码顺序分布，即 **Validate 单独 1 条 + Create/Update/Delete 各 4 条 = 13 条**：
 
-| 阶段 | Model 层钩子 | Record 层钩子 | 桥接 Handler Priority | Record 内部系统 Handler Priority |
-|------|-------------|--------------|----------------------|-------------------------------|
-| **Validate** | `OnModelValidate` | `OnRecordValidate` | -99 | **99**（用户 Handler 之后做实际验证） |
-| **Main** | `OnModelCreate/Update/Delete` | `OnRecordCreate/Update/Delete` | -99 | **-99**（先做字段拦截器） |
-| **Execute** | `OnModelCreateExecute` 等 | `OnRecordCreateExecute` 等 | -99 | **99**（用户之后做 Auth 检查/级联删除） |
-| **AfterSuccess** | `OnModelAfter*Success` | `OnRecordAfter*Success` | -99 | **-99**（先做字段拦截器） |
-| **AfterError** | `OnModelAfter*Error` | `OnRecordAfter*Error` | -99 | **-99**（先做字段拦截器） |
+| 序号 | 代码行 | 阶段 | Model 层钩子 | Record 层钩子 | 桥接 Priority | Record 内部 Priority |
+|------|--------|------|-------------|--------------|--------------|---------------------|
+| 1 | L56-L72 | Validate | `OnModelValidate` | `OnRecordValidate` | -99 | **99**（用户 Handler 之后做实际验证） |
+| 2 | L74-L90 | Create 主流程 | `OnModelCreate` | `OnRecordCreate` | -99 | **-99**（先做字段拦截器） |
+| 3 | L92-L108 | Create Execute | `OnModelCreateExecute` | `OnRecordCreateExecute` | -99 | **99**（用户之后做 Auth 检查/错误规范化） |
+| 4 | L110-L126 | Create 成功 | `OnModelAfterCreateSuccess` | `OnRecordAfterCreateSuccess` | -99 | **-99**（先做字段拦截器） |
+| 5 | L128-L144 | Create 失败 | `OnModelAfterCreateError` | `OnRecordAfterCreateError` | -99 | **-99**（先做字段拦截器） |
+| 6 | L146-L162 | Update 主流程 | `OnModelUpdate` | `OnRecordUpdate` | -99 | **-99**（先做字段拦截器） |
+| 7 | L164-L180 | Update Execute | `OnModelUpdateExecute` | `OnRecordUpdateExecute` | -99 | **99**（用户之后做 Auth 检查/错误规范化） |
+| 8 | L182-L198 | Update 成功 | `OnModelAfterUpdateSuccess` | `OnRecordAfterUpdateSuccess` | -99 | **-99**（先做字段拦截器） |
+| 9 | L200-L216 | Update 失败 | `OnModelAfterUpdateError` | `OnRecordAfterUpdateError` | -99 | **-99**（先做字段拦截器） |
+| 10 | L218-L234 | Delete 主流程 | `OnModelDelete` | `OnRecordDelete` | -99 | **-99**（先做字段拦截器 + View 检查） |
+| 11 | L236-L252 | Delete Execute | `OnModelDeleteExecute` | `OnRecordDeleteExecute` | -99 | **99**（用户之后做级联删除） |
+| 12 | L254-L270 | Delete 成功 | `OnModelAfterDeleteSuccess` | `OnRecordAfterDeleteSuccess` | -99 | **-99**（先做字段拦截器） |
+| 13 | L272-L288 | Delete 失败 | `OnModelAfterDeleteError` | `OnRecordAfterDeleteError` | -99 | **-99**（先做字段拦截器） |
+
+**总计**：1（Validate） + 4（Create） + 4（Update） + 4（Delete） = **13 条** Model→Record 桥接注册，另有对应的 13 条 Record 层内部系统 Handler。
 
 ### 6.7 DB 写入到底在哪一层发生？
 
