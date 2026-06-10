@@ -221,22 +221,61 @@ m1.Before → m2.Before → m3.Before → Action → m3.After → m2.After → m
 
 每个中间件通过调用 `e.Next()` 将控制权传递给链中的下一环，`Next()` 返回后执行后续逻辑。
 
-### 3.4 默认全局中间件执行顺序
+### 3.4 默认全局中间件执行顺序（精确 Priority 值）
 
-中间件按 `Priority` 排序执行（值越小越先执行），默认顺序定义在 [apis/middlewares.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L31-L56)：
+`Hook.Bind()` 注册中间件时使用 `sort.SliceStable` 按 `Priority` 升序排序（值越小越先执行）。所有中间件的 `Priority` 基准值为 `DefaultRateLimitMiddlewarePriority = -1000`（见 [apis/middlewares_rate_limit.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_rate_limit.go#L16)）。
 
-| 优先级 | 中间件 | ID | 作用 |
-|--------|--------|----|------|
-| -99999 | wwwRedirect | pbWWWRedirect | www 域名重定向 |
-| DefaultRateLimit - 40 | activityLogger | pbActivityLogger | 请求日志记录 |
-| DefaultRateLimit - 30 | panicRecover | pbPanicRecover | panic 恢复 |
-| DefaultRateLimit - 20 | loadAuthToken | pbLoadAuthToken | 加载认证 Token |
-| DefaultRateLimit - 10 | securityHeaders | pbSecurityHeaders | 安全响应头 |
-| Default | rateLimit | pbRateLimit | 速率限制 |
-| DefaultLoadAuthToken + 5 | superuserIPsWhitelist | pbSuperuserIPsWhitelist | 超级用户 IP 白名单 |
-| Default | BodyLimit | (匿名) | 请求体大小限制 |
+完整执行顺序（洋葱 Before 阶段，从外到内）：
 
-> 注意：`activityLogger` 在最外层，能记录所有中间件执行时间和最终结果；`panicRecover` 次之，能捕获内部 panic。
+| Priority | 中间件 | ID | 定义位置 | 作用 |
+|----------|--------|----|----------|------|
+| **-99999** | wwwRedirect | pbWWWRedirect | [middlewares.go:227-250](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L227-L250) | www → non-www 域名重定向 |
+| **-1041** | CORS | pbCors | [middlewares_cors.go:27-28](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_cors.go#L27-L28) | 跨域响应头（在 activityLogger 之前使 OPTIONS 预检不计入日志和限流） |
+| **-1040** | activityLogger | pbActivityLogger | [middlewares.go:34](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L34) `=-1000-40` | 请求日志（最外层包装，记录完整执行时间） |
+| **-1030** | panicRecover | pbPanicRecover | [middlewares.go:39](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L39) `=-1000-30` | panic 捕获恢复（在 activityLogger 内部，使 panic 也能被记录） |
+| **-1020** | loadAuthToken | pbLoadAuthToken | [middlewares.go:42](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L42) `=-1000-20` | 解析 Authorization 头，写入 `e.Auth`（**鉴权加载，不强制报错**） |
+| **-1015** | superuserIPsWhitelist | pbSuperuserIPsWhitelist | [middlewares.go:45](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L45) `=-1020+5` | 超级用户 IP 白名单检查（**必须在 loadAuthToken 之后**，依赖 `e.Auth` 是否为超级用户） |
+| **-1010** | securityHeaders | pbSecurityHeaders | [middlewares.go:48](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L48) `=-1000-10` | 设置 X-XSS-Protection、X-Content-Type-Options、X-Frame-Options |
+| **-1000** | rateLimit | pbRateLimit | [middlewares_rate_limit.go:16](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_rate_limit.go#L16) | 全局限速（在 securityHeaders 之后执行，**即使被限流也带有安全响应头**；同时依赖 `e.Auth` 区分 guest/auth 受众） |
+| **-990** | BodyLimit | pbBodyLimit | [middlewares_body_limit.go:18](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_body_limit.go#L18) `=-1000+10` | 请求体大小限制（最内层全局中间件，超限直接返回 413） |
+
+#### 洋葱模型完整调用链图示
+
+```
+wwwRedirect.Before ─┐
+   CORS.Before ─────┤
+ activityLogger.Before ─┤  (记录 __execStart 时间戳)
+  panicRecover.Before ─┤  (defer recover 就位)
+loadAuthToken.Before ──┤  (解析 Token → e.Auth)
+superuserIPsWhitelist.Before  (检查 e.Auth 是否超管 + IP 白名单)
+securityHeaders.Before ─┤  (写安全响应头)
+  rateLimit.Before ────┤  (检查速率)
+   BodyLimit.Before ───┤  (包装 limitedReader)
+          │
+        Route Action (业务 handler: e.JSON/e.NoContent/返回 error)
+          │
+   BodyLimit.After ────┘  (无额外逻辑，error 原样向上冒泡)
+  rateLimit.After ────┘  (无额外逻辑)
+securityHeaders.After ──┘  (无额外逻辑)
+superuserIPsWhitelist.After  (无额外逻辑)
+loadAuthToken.After ───┘  (无额外逻辑)
+  panicRecover.After ───┤  (若捕获 panic → 替换为 500 ApiError 向上冒泡)
+ activityLogger.After ─┤  (logRequest(e, err) 写日志 → 原样 return err)
+   CORS.After ─────────┤  (无额外逻辑)
+wwwRedirect.After ─────┘
+          │
+          ▼
+   Hook.Trigger() 最终 return err
+          │
+          ▼
+   ErrorHandler(resp, req, err) 写 JSON 错误响应
+```
+
+**关键设计细节：**
+- `activityLogger`（-1040）比 `panicRecover`（-1030）更早执行 Before，意味着日志包裹了 panic 恢复——即使内部 panic，也能被记录
+- `loadAuthToken`（-1020）必须在 `superuserIPsWhitelist`（-1015）之前，因为后者需要读取 `e.Auth` 判断是否为超级用户
+- `rateLimit`（-1000）在 `securityHeaders`（-1010）之后，确保被 429 限流的响应也带有安全头；同时 rateLimit 内部会根据 `e.Auth` 是否为 nil 选择 guest/auth 受众规则
+- `BodyLimit`（-990）是最内层全局中间件，因为它需要在解析 body 之前生效
 
 ### 3.5 中间件解绑与排除
 
@@ -418,6 +457,73 @@ return e.App.OnRecordCreateRequest().Trigger(event, func(e *core.RecordRequestEv
 
 ## 6. 错误处理与返回
 
+### 6.0 错误返回完整路径（从 Handler 到 ErrorHandler）
+
+以路由 Action 返回一个 `e.UnauthorizedError(...)` 为例，错误从产生到写入 HTTP 响应要经过以下层层传递：
+
+```
+阶段 A：业务层产生错误
+───────────────────────────────────────────────────────────────────
+recordCreate Action
+  │  if err := form.Submit(); err != nil {
+  │      return firstApiError(err, e.BadRequestError("Failed to create record", err))
+  │  }
+  ▼
+return *router.ApiError  ← 错误对象诞生
+
+阶段 B：Hook 链逐层冒泡（洋葱 After 阶段，从内到外）
+───────────────────────────────────────────────────────────────────
+BodyLimit.After           err := e.Next()  →  return err   (原样透传)
+rateLimit.After           err := e.Next()  →  return err   (原样透传)
+securityHeaders.After     err := e.Next()  →  return err   (原样透传)
+superuserIPsWhitelist.After  err := e.Next() → return err  (原样透传)
+loadAuthToken.After       err := e.Next()  →  return err   (原样透传)
+panicRecover.After
+  │  defer recover() { ... }  ← 如果是 panic 在此被捕获转为 ApiError
+  │  err := e.Next()
+  ▼  return err   (panic 已被替换为 500 ApiError，普通 err 原样透传)
+activityLogger.After
+  │  err := e.Next()
+  │  logRequest(e, err)  ← 写日志（不吞错误）
+  ▼  return err          ← 继续向上冒泡
+CORS.After                err := e.Next()  →  return err   (原样透传)
+wwwRedirect.After         err := e.Next()  →  return err   (原样透传)
+
+阶段 C：Hook.Trigger 返回给 Router
+───────────────────────────────────────────────────────────────────
+Hook.Trigger(event, v.Action)
+  │  // 最外层的 event.Next() 执行完毕
+  ▼  return err   ← Hook 链的最终返回值
+
+阶段 D：BuildMux 注册的 Handler 捕获
+───────────────────────────────────────────────────────────────────
+[tools/router/router.go:130-151]
+  │  event, cleanupFunc := r.eventFactory(resp, req)
+  │  err := routeHook.Trigger(event, v.Action)
+  │  if err != nil {
+  ▼      ErrorHandler(resp, req, err)   ← 统一错误入口
+  │  }
+  │  if cleanupFunc != nil { cleanupFunc() }
+
+阶段 E：ErrorHandler 写回 HTTP 响应
+───────────────────────────────────────────────────────────────────
+[tools/router/router.go:160-183]
+  1. err == nil? → return（无事发生）
+  2. resp.Written() == true? → return（业务已写过响应，不再覆盖）
+  3. Content-Type 为空 → 设置为 application/json
+  4. apiErr := ToApiError(err)   ← 归一化
+  5. resp.WriteHeader(apiErr.Status)   ← 写状态码
+  6. 非 HEAD 请求 → json.NewEncoder(resp).Encode(apiErr)   ← 写 JSON Body
+```
+
+**关键点：**
+- 绝大多数中间件在 After 阶段不修改 error，直接 `return err` 原样冒泡
+- 只有 `panicRecover` 会修改 error（把 panic 转为 500 ApiError）
+- `activityLogger` 会读 error 写日志，但不吞掉
+- `ErrorHandler` 有"响应已写则跳过"的守卫，避免业务已写 `e.JSON(200, ...)` 后又被错误覆盖
+
+---
+
 ### 6.1 ApiError：统一错误结构
 
 [tools/router/error.go](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/router/error.go#L35-L47)：
@@ -537,7 +643,7 @@ func firstApiError(errs ...error) *router.ApiError {
 
 ## 7. 完整请求流程示例
 
-以 `POST /api/collections/users/records` 创建记录为例：
+以 `POST /api/collections/users/records` 创建记录为例。注意 `/collections/{collection}/records` 分组通过 `Unbind(DefaultRateLimitMiddlewareId)` 解绑了全局限速，改在每个路由上用 `collectionPathRateLimit` 做集合级限速。
 
 ```
 1. http.Server 接收请求，交给 ServeMux
@@ -545,34 +651,73 @@ func firstApiError(errs ...error) *router.ApiError {
 3. 包装 ResponseWriter → ResponseWriter{written, status}
 4. 包装 Request.Body → RereadableReadCloser（支持重复读取）
 5. EventFactory 创建 RequestEvent{App, Response, Request}
-6. Hook.Trigger 启动中间件链 + recordCreate Action：
+6. Hook.Trigger 启动中间件链 + recordCreate Action（按 Priority 从小到大执行 Before）：
 
-   ┌─ activityLogger: 记录 __execStart → e.Next()
-   │   ┌─ panicRecover: defer recover → e.Next()
-   │   │   ┌─ loadAuthToken: 解析 Authorization，写入 e.Auth → e.Next()
-   │   │   │   ┌─ securityHeaders: 设置 X-XSS-Protection 等 → e.Next()
-   │   │   │   │   ┌─ superuserIPsWhitelist: 超级用户 IP 检查 → e.Next()
-   │   │   │   │   │   ┌─ BodyLimit: 检查请求体大小 → e.Next()
-   │   │   │   │   │   │   ┌─ dynamicCollectionBodyLimit: 集合级 body limit → e.Next()
-   │   │   │   │   │   │   │   └─ recordCreate Action (路由 handler)
-   │   │   │   │   │   │   │       ├─ 查找 collection
-   │   │   │   │   │   │   │       ├─ checkCollectionRateLimit
-   │   │   │   │   │   │   │       ├─ 解析 RequestInfo
-   │   │   │   │   │   │   │       ├─ 检查 CreateRule 权限
-   │   │   │   │   │   │   │       ├─ 创建 RecordRequestEvent
-   │   │   │   │   │   │   │       ├─ OnRecordCreateRequest Hook 链（含用户自定义扩展）
-   │   │   │   │   │   │   │       ├─ form.Submit() 保存记录
-   │   │   │   │   │   │   │       └─ e.JSON(200, record) 写响应
-   │   │   │   │   │   │   └─ dynamicCollectionBodyLimit After（无操作）
-   │   │   │   │   │   └─ BodyLimit After（无操作）
-   │   │   │   │   └─ superuserIPsWhitelist After（无操作）
-   │   │   │   └─ securityHeaders After（无操作）
-   │   │   └─ loadAuthToken After（无操作）
-   │   └─ panicRecover: 若 panic 捕获 → 返回 500
-   └─ activityLogger: logRequest(e, err) 记录访问日志
+   ┌─ wwwRedirect (-99999): 检查 www 前缀 → e.Next()
+   │   ┌─ CORS (-1041): 设置跨域头 → e.Next()
+   │   │   ┌─ activityLogger (-1040): Set(__execStart, time.Now()) → e.Next()
+   │   │   │   ┌─ panicRecover (-1030): defer recover() 就位 → e.Next()
+   │   │   │   │   ┌─ loadAuthToken (-1020): 解析 Authorization 头 → e.Auth → e.Next()
+   │   │   │   │   │   ┌─ superuserIPsWhitelist (-1015): 若 e.Auth 是超管则检查 IP → e.Next()
+   │   │   │   │   │   │   ┌─ securityHeaders (-1010): 写 X-XSS-Protection 等头 → e.Next()
+   │   │   │   │   │   │   │   ┌─ BodyLimit (-990): 检查 Content-Length，包装 limitedReader → e.Next()
+   │   │   │   │   │   │   │   │   ┌─ collectionPathRateLimit (-1000): 集合级速率检查 → e.Next()
+   │   │   │   │   │   │   │   │   │   ┌─ dynamicCollectionBodyLimit (-990): 集合字段累加 body 上限 → e.Next()
+   │   │   │   │   │   │   │   │   │   │   └─ recordCreate Action (路由 handler)
+   │   │   │   │   │   │   │   │   │   │       ├─ 查找 collection
+   │   │   │   │   │   │   │   │   │   │       ├─ 解析 RequestInfo
+   │   │   │   │   │   │   │   │   │   │       ├─ 检查 CreateRule 权限（API 规则级鉴权）
+   │   │   │   │   │   │   │   │   │   │       ├─ 创建 RecordRequestEvent
+   │   │   │   │   │   │   │   │   │   │       ├─ OnRecordCreateRequest Hook 链（含用户自定义扩展）
+   │   │   │   │   │   │   │   │   │   │       ├─ form.Submit() 保存记录
+   │   │   │   │   │   │   │   │   │   │       ├─ 成功: e.JSON(200, record) 写响应 → Written=true
+   │   │   │   │   │   │   │   │   │   │       └─ 失败: return firstApiError(err, e.BadRequestError(...))
+   │   │   │   │   │   │   │   │   │   └─ dynamicCollectionBodyLimit After: return err（原样透传）
+   │   │   │   │   │   │   │   │   └─ collectionPathRateLimit After: return err（原样透传）
+   │   │   │   │   │   │   │   └─ BodyLimit After: return err（原样透传）
+   │   │   │   │   │   │   └─ securityHeaders After: return err（原样透传）
+   │   │   │   │   │   └─ superuserIPsWhitelist After: return err（原样透传）
+   │   │   │   │   └─ loadAuthToken After: return err（原样透传）
+   │   │   │   └─ panicRecover After: 若捕获 panic → 转为 500 ApiError；否则 return err
+   │   │   └─ activityLogger After: logRequest(e, err) 写访问日志 → return err
+   │   └─ CORS After: return err（原样透传）
+   └─ wwwRedirect After: return err（原样透传）
 
-7. 若无错误，响应已在 Action 中通过 e.JSON 写入
-8. 若有错误，ErrorHandler 归一化后写入 JSON 错误响应
+7. Hook.Trigger() 返回最终 err
+8. BuildMux handler 判断：
+   - err == nil 且 Written==true → 正常结束（Action 已通过 e.JSON 写响应）
+   - err != nil 且 Written==false → 调用 ErrorHandler(resp, req, err) 写 JSON 错误
+   - err != nil 但 Written==true → ErrorHandler 直接跳过（业务已写）
+```
+
+#### 错误场景完整走读（CreateRule 校验失败）
+
+```
+recordCreate Action
+  └─ return e.ForbiddenError("CreateRule not satisfied", ruleErr)
+        │
+        ▼
+  Hook 链 After 阶段逐层冒泡（所有中间件原样 return err）
+        │
+        ▼
+  activityLogger.After:
+    ├─ logRequest(e, err) → 从 ApiError 中提取 Message/RawData 写入 slog
+    └─ return err
+        │
+        ▼
+  Hook.Trigger() return err
+        │
+        ▼
+  BuildMux handler:
+    └─ if err != nil { ErrorHandler(resp, req, err) }
+          │
+          ▼
+     ErrorHandler:
+       1. getWritten(resp) → false（业务未写响应）
+       2. Content-Type = "application/json"
+       3. apiErr := ToApiError(err) → 已是 ApiError，直接返回
+       4. resp.WriteHeader(403)
+       5. json.Encode({status:403, message:"...", data:{...}})
 ```
 
 ---
