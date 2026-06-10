@@ -335,20 +335,91 @@ NOT EXISTS (
 
 实际效果：对于 `=`，断言两集合的每个值都相等（即两集合都是同一值的重复）；对于 `>`，断言左集合的每个值都大于右集合的每个值。
 
-#### 3.4.4 为什么需要直接表达式 + 全称量化的 AND？
+#### 3.4.4 直接表达式 + 全称量化的 AND：空关系语义分析
 
-直觉上只用 NOT EXISTS 就够了，但 PocketBase 同时保留了直接的 JOIN 行级表达式：
+原文档的概括「关联非空」只对部分运算符成立。完整语义需要结合三层机制分析：
 
-```go
-expr = dbx.Enclose(dbx.And(expr, mm))   // expr 是直接比较，mm 是全称量化
+#### 3.4.4.1 JSONEach 对不同列值的归一化
+
+多值关系字段存储为 JSON 数组，`JSONEach` [tools/dbutils/json.go](./tools/dbutils/json.go#L10-L17) 在 LEFT JOIN 时做归一化：
+
+```sql
+json_each(CASE
+  WHEN iif(json_valid([[col]]), json_type([[col]])='array', FALSE)
+  THEN [[col]]                           -- 合法 JSON 数组 → 直接展开
+  ELSE json_array([[col]])               -- 其他一切 → 包装成单元素数组
+END)
 ```
 
-原因是 LEFT JOIN 语义：
-1. **直接表达式**处理 JOIN 产生的行，配合 `SELECT DISTINCT` 实现存在性（至少一个关联值匹配）
-2. **全称量化**过滤掉"部分匹配但不全匹配"的记录
-3. 两者 AND 后 = **所有关联值都满足条件，且关联非空**
+不同列值展开后的行数差异：
 
-如果关系为空（JSON 数组为 `[]`），LEFT JOIN 产生 NULL 行，直接表达式不匹配，记录被排除。
+| 关系列存储值 | json_each 展开结果 | LEFT JOIN 关联后行数 |
+|-------------|-------------------|---------------------|
+| `'["id1","id2"]'` （合法多值数组） | 2 行：id1、id2 | 最多 2 行（关联存在时） |
+| `'[]'` （合法空数组） | **0 行** | 0 行 → 关联列全为 NULL |
+| `NULL`（空列） | `json_array(NULL)` → 1 行（value=NULL） | 1 行，关联列全为 NULL |
+| `''`（空字符串） | `json_array('')` → 1 行（value=''） | 1 行，关联列全为 NULL |
+| `'"id1"'` （合法 JSON 但非数组） | `json_array('id1')` → 1 行 | 最多 1 行 |
+
+无论哪种形式，**空关系**（无有效关联 ID）最终在直接表达式中看到的关联列值都是 `NULL`。差异只在 MultiMatchSubquery 的内部计数。
+
+#### 3.4.4.2 `NOT EXISTS` 对空结果集的行为
+
+MultiMatchSubquery（关联子查询）对空关系返回 0 行：
+- 空数组 `'[]'` → json_each 0 行 → 子查询 0 行
+- NULL 列 → json_each 1 行（value=NULL）→ LEFT JOIN 关联失败 → 子查询返回 1 行 `multiMatchValue = NULL`
+
+但 `NOT EXISTS (空结果集)` → **TRUE**，而 `NOT EXISTS (一行值为 NULL 的结果集)` 的真值取决于内层 `WHERE NOT(...)` 对 NULL 的处理。
+
+#### 3.4.4.3 resolveEqualExpr 对 NULL 的分支处理
+
+`resolveEqualExpr` [tools/search/filter.go](./tools/search/filter.go#L328-L410) 是理解空关系匹配的关键。其根据 `equal`（`=` 为 true，`!=` 为 false）切换四组操作符：
+
+| 参数 | `=` (equal=true) | `!=` (equal=false) |
+|------|-----------------|-------------------|
+| `equalOp` | `=` | `IS NOT` |
+| `nullEqualOp` | `IS` | `IS NOT` |
+| `concatOp` | `OR` | `AND` |
+| `nullExpr` | `IS NULL` | `IS NOT NULL` |
+
+SQLite 中 `IS NOT` 的关键特性：**将 NULL 视为可比较的独立值**，因此：
+- `NULL IS NOT 'abc'` → **TRUE**（NULL 确实不等于 'abc'）
+- `NULL != 'abc'` → **NULL**（标准三值逻辑，非 TRUE）
+
+这导致 `!=` 和 `=` 在空关系场景下行为完全不对称。
+
+#### 3.4.4.4 逐运算符边界真值表（空关系场景）
+
+假设 `self_rel_many` 是多值关系且为空（无任何有效关联），则：
+
+| DSL 表达式 | 直接表达式 | 直接结果 | NOT EXISTS | 最终 AND | 是否返回 |
+|-----------|-----------|---------|-----------|---------|---------|
+| `title = 'test'` | `NULL = 'test'` | NULL | TRUE | NULL | ❌ 否 |
+| `title = ''` | `(NULL = '' OR NULL IS NULL)` | TRUE | TRUE | TRUE | ✅ **是** |
+| `title = null` | `(NULL = '' OR NULL IS NULL)` | TRUE | TRUE | TRUE | ✅ **是** |
+| `title != 'test'` | `NULL IS NOT 'test'` | TRUE | TRUE | TRUE | ✅ **是** |
+| `title != ''` | `(NULL IS NOT '' AND NULL IS NOT NULL)` | FALSE | TRUE | FALSE | ❌ 否 |
+| `title != null` | `(NULL IS NOT '' AND NULL IS NOT NULL)` | FALSE | TRUE | FALSE | ❌ 否 |
+| `title ~ 'test'` | `NULL LIKE '%test%'` | NULL | TRUE | NULL | ❌ 否 |
+| `title !~ 'test'` | `NULL NOT LIKE '%test%'` | NULL | TRUE | NULL | ❌ 否 |
+| `title > 1` | `NULL > 1` | NULL | TRUE | NULL | ❌ 否 |
+| `title >= 1` | `NULL >= 1` | NULL | TRUE | NULL | ❌ 否 |
+| `title < 1` | `NULL < 1` | NULL | TRUE | NULL | ❌ 否 |
+| `title <= 1` | `NULL <= 1` | NULL | TRUE | NULL | ❌ 否 |
+
+**结论**：「关联非空」只对 `=`（比较非空值）、`~`、`!~`、`>`、`>=`、`<`、`<=` 成立。以下两种情况空关系**会匹配成功**：
+1. `!= '非空值'` — `IS NOT` 将 NULL 视为与任何非空值都不相同
+2. `= ''` 或 `= null` — `resolveEqualExpr` 的空值分支自动补上 `OR IS NULL`
+
+#### 3.4.4.5 AND 组合的真实含义
+
+```go
+expr = dbx.Enclose(dbx.And(expr, mm))
+```
+
+对需要关联非空的运算符（如 `= 'test'`）：直接表达式排除空关系，全称量化排除部分匹配。
+
+对空关系能通过的运算符（如 `!= 'test'`）：直接表达式让空关系通过，全称量化也为 TRUE（空集无反例），因此**空关系记录被视为满足「所有关联值都满足 != 'test'」**——因为零个元素的集合上全称命题空洞为真（vacuously true）。
 
 ### 3.5 三种模式的 SQL 输出对比
 
@@ -357,11 +428,13 @@ expr = dbx.Enclose(dbx.And(expr, mm))   // expr 是直接比较，mm 是全称�
 | DSL 表达式 | 模式 | WHERE 子句核心 | 行为解释 |
 |-----------|------|---------------|---------|
 | `title > true` | 标量字段 | `[[demo4.title]] > 1` | 无 JOIN，直接列比较 |
-| `self_rel_one.title > true` | 单值关系 + 标准运算符 | `[[demo4_self_rel_one.title]] > 1` | 单值关系一对一，不触发 Multi-Match，实际效果等价于 ANY |
-| `self_rel_many.title ?= 'test'` | 多值关系 + ANY 运算符 | `[[demo4_self_rel_many.title]] = {:TEST}` | 仅 LEFT JOIN + DISTINCT，**存在至少一个关联记录 title = 'test'** 即返回 |
+| `self_rel_one.title > true` | 单值关系 + 标准运算符 | `[[demo4_self_rel_one.title]] > 1` | 单值关系一对一，不触发 Multi-Match |
+| `self_rel_many.title ?= 'test'` | 多值关系 + ANY 运算符 | `[[demo4_self_rel_many.title]] = {:TEST}` | 仅 LEFT JOIN + DISTINCT，**存在至少一个关联记录 title = 'test'** 即返回；空关系不匹配 |
 | `self_rel_many.title = 'test'` | 多值关系 + 标准运算符 | `([[...]] = {:TEST} AND NOT EXISTS( WHERE NOT( [[...]] = {:TEST} ) ))` | 直接表达式做存在性 + NOT EXISTS 全称量化 → **所有关联记录的 title 都必须等于 'test'，且关联非空** |
-| `self_rel_many.self_rel_one ?> true` | 嵌套多值关系 + ANY 运算符 | `[[demo4_self_rel_many.self_rel_one]] > 1` | 仅 LEFT JOIN + DISTINCT，**存在至少一条路径满足 self_rel_one > 1** 即返回 |
-| `self_rel_many.self_rel_one > true` | 嵌套多值关系 + 标准运算符 | `(直接表达式 AND NOT EXISTS(子查询 WHERE NOT(...)))` | 完整关系链上**所有路径**的 self_rel_one 都必须 > 1 |
+| `self_rel_many.title ?!= 'test'` | 多值关系 + ANY 不等运算符 | `[[demo4_self_rel_many.title]] IS NOT {:TEST}` | 仅 LEFT JOIN + DISTINCT，**存在至少一个关联记录 title != 'test'** 即返回；空关系下 NULL IS NOT 'test' = TRUE，**空关系也返回** |
+| `self_rel_many.title != 'test'` | 多值关系 + 标准不等运算符 | `([[...]] IS NOT {:TEST} AND NOT EXISTS( WHERE NOT( [[...]] IS NOT {:TEST} ) ))` | 所有关联记录的 title 都必须 != 'test'；**空关系记录也返回**（空洞真） |
+| `self_rel_many.self_rel_one ?> true` | 嵌套多值关系 + ANY 运算符 | `[[demo4_self_rel_many.self_rel_one]] > 1` | 仅 LEFT JOIN + DISTINCT，**存在至少一条路径满足 self_rel_one > 1** 即返回；空关系不匹配 |
+| `self_rel_many.self_rel_one > true` | 嵌套多值关系 + 标准运算符 | `(直接表达式 AND NOT EXISTS(子查询 WHERE NOT(...)))` | 完整关系链上**所有路径**的 self_rel_one 都必须 > 1，且路径非空 |
 | `demo4_via_rel_one_unique.id = true` | 反向单值 + 唯一索引 | `[[demo3_demo4_via_rel_one_unique.id]] = 1` | 唯一索引保证一对一，无需全称量化 |
 | `demo4_via_rel_one_cascade.id = true` | 反向单值 + 无唯一索引 | `(直接表达式 AND NOT EXISTS(...))` | 多条反向记录可能指向同一目标 → 需要全称量化 |
 
@@ -412,6 +485,8 @@ query.AndWhere(expr)
 | JSON 字段（NullFallbackDisabled） | `a IS b` 或 `a IS NOT b` |
 
 对于 `!=`，始终使用 `IS NOT` 而非 `<>`，因为 SQLite 中 `'value' <> nullableColumn` 在 nullableColumn 为 NULL 时返回 NULL 而非 TRUE。
+
+> **注意**：`IS NOT` 将 NULL 视为可比较的独立值，导致 `NULL IS NOT 'value'` 计算为 TRUE。这使得 `!=` 在多值关系为空时会匹配成功（详见 §3.4.4 空关系语义分析）。
 
 ### 4.2 唯一索引检测决定 Multi-Match
 
