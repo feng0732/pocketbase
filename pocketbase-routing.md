@@ -1014,68 +1014,146 @@ case error:
 ```go
 func ErrorHandler(resp http.ResponseWriter, req *http.Request, err error) {
     // ...
+    header := resp.Header()
+    if header.Get("Content-Type") == "" {
+        header.Set("Content-Type", "application/json")  // ErrorHandler 设置 Content-Type
+    }
     apiErr := ToApiError(err)          // 已是 ApiError，原样返回
     resp.WriteHeader(apiErr.Status)    // 写 HTTP 429
     if req.Method != http.MethodHead {
-        json.NewEncoder(resp).Encode(apiErr)  // JSON 编码 ApiError 的导出字段
+        json.NewEncoder(resp).Encode(apiErr)  // JSON 编码（按 struct 字段声明顺序）+ 追加换行
     }
 }
 ```
 
-**最终 HTTP 响应（完整原始字节）**：
+**响应头核准**（按写入顺序）：
+
+| 响应头 | 值 | 设置位置 |
+|--------|----|----------|
+| X-XSS-Protection | `1; mode=block` | [securityHeaders 中间件](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L293) Before 阶段 |
+| X-Content-Type-Options | `nosniff` | [securityHeaders 中间件](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L294) Before 阶段 |
+| X-Frame-Options | `SAMEORIGIN` | [securityHeaders 中间件](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L295) Before 阶段（**不是 DENY**） |
+| Content-Type | `application/json` | [ErrorHandler](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/router/router.go#L169)（若为空则设置） |
+| Date | 由 http.Server 自动设置 | Go 标准库 net/http |
+| Transfer-Encoding | `chunked` | Go 标准库（未显式设置 Content-Length 时自动使用分块传输） |
+
+> 注意：**不会出现 Content-Length 头**。因为 ErrorHandler 中 `WriteHeader` 在 `Encode` 之前调用，且未显式设置 Content-Length，Go 的 http.Server 会退化为 `Transfer-Encoding: chunked` 分块传输。
+
+**响应体字节精确核准**：
+
+Go `encoding/json` 按结构体字段**声明顺序**编码（不是按字段名排序）。ApiError 导出字段声明顺序为：
+
+```go
+type ApiError struct {
+    rawData any            // 非导出，不编码
+    Data    map[string]any `json:"data"`     // 第 1 位
+    Message string         `json:"message"`  // 第 2 位
+    Status  int            `json:"status"`   // 第 3 位
+}
+```
+
+所以编码结果为（`json.NewEncoder.Encode` 会在末尾追加换行符 `\n`）：
+
+```
+{"data":{},"message":"Too Many Requests.","status":429}\n
+```
+
+逐字节计数（共 **56 字节**）：
+
+| 索引 | 字节 | 字符 | 说明 |
+|------|------|------|------|
+| 0 | 0x7b | `{` | |
+| 1 | 0x22 | `"` | |
+| 2 | 0x64 | `d` | |
+| 3 | 0x61 | `a` | |
+| 4 | 0x74 | `t` | |
+| 5 | 0x61 | `a` | |
+| 6 | 0x22 | `"` | |
+| 7 | 0x3a | `:` | |
+| 8 | 0x7b | `{` | Data: map[string]any{} → 空对象 |
+| 9 | 0x7d | `}` | |
+| 10 | 0x2c | `,` | |
+| 11 | 0x22 | `"` | |
+| 12 | 0x6d | `m` | |
+| 13 | 0x65 | `e` | |
+| 14 | 0x73 | `s` | |
+| 15 | 0x73 | `s` | |
+| 16 | 0x61 | `a` | |
+| 17 | 0x67 | `g` | |
+| 18 | 0x65 | `e` | |
+| 19 | 0x22 | `"` | |
+| 20 | 0x3a | `:` | |
+| 21 | 0x22 | `"` | |
+| 22–40 | — | `"Too Many Requests."` | Message 共 19 个字符 |
+| 41 | 0x2c | `,` | |
+| 42–49 | — | `"status"` | |
+| 50 | 0x3a | `:` | |
+| 51–53 | — | `429` | Status 三位数字 |
+| 54 | 0x7d | `}` | |
+| 55 | 0x0a | `\n` | json.Encoder.Encode 自动追加的换行符 |
+
+**最终 HTTP 响应（完整原始字节，含分块传输）**：
 
 ```http
 HTTP/1.1 429 Too Many Requests
-Content-Type: application/json
+X-Xss-Protection: 1; mode=block
 X-Content-Type-Options: nosniff
-X-Frame-Options: DENY
-X-XSS-Protection: 1; mode=block
+X-Frame-Options: SAMEORIGIN
+Content-Type: application/json
 Date: Wed, 10 Jun 2026 10:00:00 GMT
-Content-Length: 59
+Transfer-Encoding: chunked
 
-{"status":429,"message":"Too Many Requests.","data":{}}
+38
+{"data":{},"message":"Too Many Requests.","status":429}
+0
+
 ```
 
+（分块编码：`38` = 十六进制 56 = 响应体字节数；最后 `0\r\n\r\n` 标识分块结束。）
+
 关键点：
+- 字段顺序是 `data → message → status`，由 ApiError 结构体字段声明顺序决定（不是按名字排序）
 - `data` 字段是空对象 `{}`，不向客户端暴露 `triggered rate limit rule: ...` 的内部信息
-- `message` 是 Sentenize 处理后的 `"Too Many Requests."`（首字母大写 + 句号结尾）
-- 安全响应头（X-Content-Type-Options 等）已由 securityHeaders 中间件在 Before 阶段写入
+- `X-Frame-Options` 实际值是 `SAMEORIGIN`，不是 `DENY`
+- 没有 Content-Length 头，使用 Transfer-Encoding: chunked
 
 #### 第四步：activityLogger 记录的日志字段
 
-[apis/middlewares.go:394-418](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L394-L418)
+[apis/middlewares.go:365-464](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L365-L464)
 
-```go
-if err != nil {
-    apiErr, isPlainApiError := err.(*router.ApiError)
-    if isPlainApiError || errors.As(err, &apiErr) {
-        if status == 0 {                          // Written=false，status 还没写
-            status = apiErr.Status                 // 从 ApiError.Status 读取 = 429
-        }
-        var errMsg string
-        if isPlainApiError {                        // 是直接的 *ApiError（非包装）
-            errMsg = apiErr.Message                  // = "Too Many Requests."
-        } else { ... }
-        attrs = append(attrs,
-            slog.String("error", errMsg),           // "error": "Too Many Requests."
-            slog.Any("details", apiErr.RawData()),   // "details": 原始 error.Error() 字符串
-        )
-    }
-}
-```
+`logRequest()` 函数按以下**代码顺序**向 attrs 切片追加字段（slog 文本输出按追加顺序打印）：
 
-**最终写入的日志（slog Error 级别）**：
+| 顺序 | 字段 | 值来源 | 条件 | 429 场景示例值 |
+|------|------|--------|------|--------------|
+| 1 | `type` | 硬编码 "request" | 始终 | `request` |
+| 2 | `execTime` | `time.Since(started) / ms` | started != zero（activityLogger Before 已设置） | `1.234` |
+| 3 | `meta` | `event.Get(RequestEventKeyLogMeta)` | meta != nil（普通请求无） | 不出现 |
+| 4 | `error` | `apiErr.Message`（isPlainApiError 时）| err != nil（是 ApiError） | `"Too Many Requests."` |
+| 5 | `details` | `apiErr.RawData()` → `error.Error()` 字符串 | err != nil（是 ApiError） | `"triggered rate limit rule: {\"label\":\"users:create\",...}"` |
+| 6 | `url` | `event.Request.URL.RequestURI()`（截断 3000） | 始终 | `/api/collections/users/records` |
+| 7 | `method` | `strings.ToUpper(Method)`（截断 50） | 始终 | `POST` |
+| 8 | `status` | `apiErr.Status`（status==0 时从 ApiError 补）| 始终 | `429` |
+| 9 | `referer` | `event.Request.Referer()`（截断 2000） | 始终 | `""`（空） |
+| 10 | `userAgent` | `event.Request.UserAgent()`（截断 2000） | 始终 | `"curl/8.0.0"` |
+| 11 | `auth` | `Auth.Collection().Name` 或 `""` | 始终（Auth=nil 时空串） | `""`（未认证） |
+| 12 | `authId` | `Auth.Id` | Auth != nil **且** `Settings.Logs.LogAuthId` | 不出现 |
+| 13 | `userIP` | `event.RealIP()` | `Settings.Logs.LogIP`（默认开启） | `"192.168.1.100"` |
+| 14 | `remoteIP` | `event.RemoteIP()` | `Settings.Logs.LogIP`（默认开启） | `"192.168.1.100"` |
+
+日志消息 msg 格式：`method + " " + url.PathUnescape(requestUri)`（失败用 `Logger().Error`，成功用 `Logger().Info`）。
+
+**最终写入的 slog 文本日志（429 场景，字段按实际代码顺序）**：
 
 ```
 level=ERROR
 msg="POST /api/collections/users/records"
 type=request
 execTime=1.234
+error="Too Many Requests."
+details="triggered rate limit rule: {\"label\":\"users:create\",\"audience\":\"\",\"duration\":60,\"maxRequests\":60}"
 url=/api/collections/users/records
 method=POST
 status=429
-error="Too Many Requests."
-details="triggered rate limit rule: {\"label\":\"users:create\",\"audience\":\"\",\"duration\":60,\"maxRequests\":60}"
 referer=""
 userAgent="curl/8.0.0"
 auth=""
@@ -1084,9 +1162,11 @@ remoteIP="192.168.1.100"
 ```
 
 关键点：
-- 日志的 `error` 字段是公开的 Message（与响应一致）
-- 日志的 `details` 字段包含内部的 `triggered rate limit rule: ...`，用于排查触发了哪条规则
-- 这个 `details` **不会**出现在 HTTP 响应中，只在服务端日志里
+- 日志字段顺序严格按 `logRequest()` 代码中的 `attrs = append(attrs, ...)` 顺序：`error` 和 `details` 出现在 `url`/`method`/`status` **之前**（因为在 err 判断分支中先 append）
+- `error` 字段是公开的 Message（与 HTTP 响应一致）
+- `details` 字段包含内部的 `triggered rate limit rule: ...`，用于排查触发了哪条规则
+- `details` **不会**出现在 HTTP 响应中，只在服务端日志里
+- `meta`、`authId` 在普通 429 场景不出现（条件不满足）
 
 ---
 
