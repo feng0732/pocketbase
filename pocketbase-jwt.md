@@ -427,7 +427,207 @@ recordAuthRefresh
 
 ---
 
-## 八、安全设计要点总结
+## 八、Token 失效与续期边界详解
+
+PocketBase 没有传统的"Token 黑名单"机制，已签发 Token 是否有效完全取决于 **验签密钥是否匹配** + **exp 是否过期**。而验签密钥由两部分组成：`Record.tokenKey + Collection.AuthToken.Secret`。因此，分析失效边界就是追踪这两个值在什么场景下会发生变化，以及 `refreshable` Claim 如何控制续期。
+
+### 8.1 Record 级 tokenKey 的刷新触发——`onRecordSaveExecute`
+
+核心触发逻辑位于 [core/record_model.go#L1429-L1474](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/record_model.go#L1429-L1474)，在每次保存 Record（Create/Update）时的 Hook 中执行：
+
+```go
+func onRecordSaveExecute(e *RecordEvent) error {
+    if e.Record.Collection().IsAuth() {
+        if !e.Record.IsNew() {  // 只针对 Update，不针对 Create
+            lastSavedRecord, err := e.App.FindRecordById(e.Record.Collection(), e.Record.Id)
+            // ...
+            // ensure that the token key is regenerated on password change or email change
+            if lastSavedRecord.TokenKey() == e.Record.TokenKey() &&
+                (lastSavedRecord.Get(FieldNamePassword) != e.Record.Get(FieldNamePassword) ||
+                    lastSavedRecord.Email() != e.Record.Email()) {
+                e.Record.RefreshTokenKey()
+            }
+        }
+    }
+    // ...
+}
+```
+
+**触发条件（三个必须同时满足）：**
+
+| 条件 | 说明 |
+|---|---|
+| `!e.Record.IsNew()` | 是已有 Record 的 Update，不是首次 Create |
+| `lastSavedRecord.TokenKey() == e.Record.TokenKey()` | 本次保存还没有手动改过 tokenKey |
+| 密码变化 **或** 邮箱变化 | 数据库里的 password hash / email 与新值不一致 |
+
+`RefreshTokenKey()` 的实现见 [core/record_model_auth.go#L46-L48](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/record_model_auth.go#L46-L48)：
+
+```go
+func (m *Record) RefreshTokenKey() {
+    m.Set(FieldNameTokenKey+autogenerateModifier, "")
+}
+```
+
+它利用 `TextField` 的 `:autogenerate` 修饰符机制（定义见 [core/field_text.go#L383-L393](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/field_text.go#L383-L393)），在字段真正落库前生成随机字符串。
+
+### 8.2 各类场景对 Token 有效性的影响
+
+下面逐一分析各种用户操作对 **已签发 Token** 的影响：
+
+#### ✅ 场景一：用户修改密码 → **所有旧 Token 立即失效**
+
+触发路径：
+1. 调用 `SetPassword("newPass")` → password 的 bcrypt hash 变化
+2. `Save(record)` → 进入 `onRecordSaveExecute`
+3. 检测到 `lastSavedRecord.Get(password) != e.Record.Get(password)` → 调用 `RefreshTokenKey()`
+4. 新 tokenKey 写入数据库
+5. 旧 Token 验签密钥 `旧tokenKey + Collection.Secret` ≠ 新密钥 → 全部失效
+
+**附加清理**（仅密码变更时，不包含邮箱变更）：
+
+- 清掉所有 MFA 会话：[core/mfa_model.go#L132-L157](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/mfa_model.go#L132-L157)
+  ```go
+  old := e.Record.Original().GetString(FieldNamePassword + ":hash")
+  new := e.Record.GetString(FieldNamePassword + ":hash")
+  if old != new {
+      err = e.App.DeleteAllMFAsByRecord(e.Record)
+  }
+  ```
+- 清掉所有 AuthOrigin（登录设备指纹）：[core/auth_origin_model.go#L114-L139](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/auth_origin_model.go#L114-L139)
+  ```go
+  if old != new {
+      err = e.App.DeleteAllAuthOriginsByRecord(e.Record)
+  }
+  ```
+
+这两个 Hook 使用 `e.Record.Original()` 读取变更前的 password hash 做对比，比 `onRecordSaveExecute` 更精准——只认密码变化，不认邮箱变化。
+
+#### ✅ 场景二：用户变更邮箱（确认后）→ **所有旧 Token 立即失效**
+
+变更邮箱分两步：
+
+**Step 1：发起请求** `/api/collections/{collection}/request-email-change`
+- 需要带当前登录 Token（已过 `RequireSameCollectionContextAuth`）
+- 用户提交新邮箱 + 当前密码
+- 系统生成 `TokenTypeEmailChange` 类型的 JWT（含 `newEmail` claim），发邮件到新邮箱
+- **此时 tokenKey 不变**，旧 Token 仍然有效
+
+**Step 2：确认邮箱** `/api/collections/{collection}/confirm-email-change` → 见 [apis/record_auth_email_change_confirm.go#L11-L52](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_auth_email_change_confirm.go#L11-L52)
+
+```go
+e.Record.SetEmail(e.NewEmail)   // 改 email
+e.Record.SetVerified(true)      // 顺便标记已验证
+if err := e.App.Save(e.Record); err != nil { ... }
+```
+
+- `Save` 进入 `onRecordSaveExecute`
+- 检测到 `lastSavedRecord.Email() != e.Record.Email()` → `RefreshTokenKey()`
+- 旧 Token 全部失效
+
+> 💡 **为什么改邮箱也要让 Token 失效？** 防止原邮箱被攻击者接管后仍持有有效 Token——邮箱作为身份恢复手段变更后，必须吊销所有会话。
+
+#### ✅ 场景三：管理员修改 Collection 的 AuthToken.Secret → **该 Collection 下所有用户的所有 Token 立即失效**
+
+验签密钥是 `record.TokenKey() + record.Collection().AuthToken.Secret`，后者是 Collection 级配置，存在数据库里。管理员在后台修改（或通过 API 更新 Collection）后：
+- 后续签发新 Token 使用新 Secret
+- 已有 Token 在下次请求走 `FindAuthRecordByToken` 验签时，用新密钥验证旧签名 → 失败
+- **不需要改每个用户的 tokenKey**，整个 Collection 一次性全部失效
+
+同样的逻辑适用于其他 Token 类型的 Secret：`PasswordResetToken.Secret`、`EmailChangeToken.Secret`、`VerificationToken.Secret`、`FileToken.Secret`——修改后对应的 Token 全部作废。
+
+#### ❌ 场景四：修改 AuthRule → **已签发 Token 不会立即失效**
+
+AuthRule 的校验位置在 [apis/record_helpers.go#L58-L61](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_helpers.go#L58-L61)：
+
+```go
+ok, err := e.App.CanAccessRecord(authRecord, originalRequestInfo, authRecord.Collection().AuthRule)
+if !ok {
+    return firstApiError(err, e.ForbiddenError("The request doesn't satisfy the collection requirements to authenticate.", err))
+}
+```
+
+这段代码**只在签发新 Token 时执行**（即 `RecordAuthResponse` 里），包括：
+- 密码登录、OAuth2 登录、OTP 登录
+- Token 刷新（`auth-refresh` 也走 `recordAuthResponse`）
+
+而普通受保护请求的 `loadAuthToken` 只做验签和查 Record，**不会再次执行 AuthRule 校验**。
+
+所以：
+- 管理员把 AuthRule 从 `""`（允许所有人）收紧为 `"verified = true"` → 已登录的未验证用户还能继续用现有 Token
+- 这些用户等到 Token 过期或主动刷新时，才会被 AuthRule 拦下
+
+#### ❌ 场景五：修改 verified 状态（仅）→ **已签发 Token 不会立即失效**
+
+改 verified 字段走正常的 Record Update，但 `onRecordSaveExecute` 只检测 password 和 email 变化，不检测 verified。所以 verified 变化 **不会触发 `RefreshTokenKey()`**。
+
+但有一种特殊情况：**邮箱验证确认时如果 PasswordAuth 未启用**，见 [apis/record_auth_verification_confirm.go#L50-L53](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_auth_verification_confirm.go#L50-L53)：
+
+```go
+if !e.Record.Collection().PasswordAuth.Enabled {
+    e.Record.SetRandomPassword()  // ← 这里会触发 RefreshTokenKey()
+}
+```
+
+`SetRandomPassword` 的实现在 [core/record_model_auth.go#L61-L73](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/core/record_model_auth.go#L61-L73)，内部显式调用了 `RefreshTokenKey()`。这种纯 OAuth2/OTP 用户在首次验证邮箱时，会因为生成随机密码而间接刷新 tokenKey。
+
+#### ❌ 场景六：修改其他字段（name、avatar、自定义字段等）→ **Token 不变**
+
+`onRecordSaveExecute` 只盯着 password 和 email 两个字段。
+
+### 8.3 续期边界：`refreshable` Claim
+
+普通 Auth Token 的 `refreshable = true`，静态 Token 的 `refreshable = false`。在 [apis/record_auth_refresh.go#L20-L34](file:///d:/fz/0601/solo-dogfeeding/code/155-pocketbase/apis/record_auth_refresh.go#L20-L34)：
+
+```go
+claims, _ := security.ParseUnverifiedJWT(token)
+if v, ok := claims[core.TokenClaimRefreshable]; ok && cast.ToBool(v) {
+    token, tokenErr = e.Record.NewAuthToken()  // 签发新 Token
+}
+// 如果 refreshable=false，直接复用原 token 返回（不签发新的）
+```
+
+**注意一个重要细节**：即使 `refreshable=false`，只要原 Token 还没过期、验签通过，请求依然能正常走——只是 `/auth-refresh` 接口不会给你换新 Token。静态 Token 通常用于 API Key 风格的长期访问凭证。
+
+### 8.4 失效场景汇总表
+
+| 操作 | 触发者 | tokenKey 变化？ | Collection Secret 变化？ | 已签发 Token 是否失效 |
+|---|---|---|---|---|
+| 用户修改密码 | 用户/管理员 | ✅ 刷新 | ❌ | ✅ **全部失效** |
+| 用户重置密码（忘记密码） | 用户 | ✅ 刷新 | ❌ | ✅ **全部失效** |
+| 邮箱变更（确认后） | 用户 | ✅ 刷新 | ❌ | ✅ **全部失效** |
+| 管理员改 Collection.AuthToken.Secret | 管理员 | ❌ | ✅ 变化 | ✅ **该 Collection 全部用户失效** |
+| 管理员改 AuthRule（如 `verified = true`） | 管理员 | ❌ | ❌ | ❌ 仅下次签发/刷新才校验 |
+| 管理员改 verified 字段 | 管理员 | ❌* | ❌ | ❌ 下次刷新才拦截 |
+| 纯 OAuth2 用户首次邮箱验证 | 用户 | ✅* | ❌ | ✅* 因 SetRandomPassword 间接刷新 |
+| 修改普通字段（name/avatar 等） | 用户 | ❌ | ❌ | ❌ Token 继续有效 |
+| Token 自然过期 | 时间 | ❌ | ❌ | ✅ exp 校验失败 |
+
+> * 仅在 PasswordAuth 未启用的邮箱验证确认场景下间接刷新
+
+### 8.5 续期与失效的交互时序
+
+```
+用户 T0 登录 ──────────────────────────────────────────────► 签发 TokenA (exp=T0+5d, refreshable=true)
+        │
+        ├── T1 (T0+1d)  正常请求 ──► loadAuthToken 验签通过 ──► 200 OK
+        │
+        ├── T2 (T0+2d)  修改密码 ──► RefreshTokenKey() ──► TokenA 立即失效
+        │                              │
+        │                              └── T2+1 用 TokenA 请求 ──► 验签密钥不匹配 ──► 401
+        │
+        └── T3 (T0+3d)  /auth-refresh
+               │
+               ├─ 如果 TokenA 还在（假设没改密码）
+               │    └─ ParseUnverifiedJWT 检查 refreshable=true ──► 签发 TokenB (exp=T3+5d)
+               │
+               └─ 如果 TokenA 已因改密码失效
+                    └─ loadAuthToken 阶段就 401，根本到不了 auth-refresh handler
+```
+
+---
+
+## 九、安全设计要点总结
 
 | 设计 | 位置 | 作用 |
 |---|---|---|
