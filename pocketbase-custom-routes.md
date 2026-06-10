@@ -151,16 +151,18 @@ for each method on app that starts with "On":
 
 [plugins/jsvm/jsvm.go#L365-L463](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/jsvm.go#L365-L463) 中 `watchHooks()` 的实现：
 
-#### 核心机制：非增量更新，而是全进程重启
+#### 核心机制：非增量更新，触发完整的应用终止 + 重启流程
 
-HooksWatch **不会**对已注册的路由或 Hook 做任何增量修改。当 `pb_hooks` 目录下文件发生变化时，它触发的是**整个应用进程的重启**。
+HooksWatch **不会**对已注册的路由或 Hook 做任何增量修改。当 `pb_hooks` 目录下文件发生变化时，它触发的是 `app.Restart()` —— 这会执行完整的 OnTerminate 钩子链、资源清理，然后（在非 Windows 平台）通过 `execve` 系统调用替换整个进程。
 
 ```
 watchHooks()
 ├── 创建 fsnotify.Watcher
 ├── 递归添加 pb_hooks 下所有非隐藏、非 node_modules 子目录
 │   └── filepath.WalkDir → watcher.Add(path)
-├── 注册 OnTerminate 钩子：关闭 watcher + 防抖定时器
+├── 注册 OnTerminate 钩子（关闭 watcher + 防抖定时器）
+│   Id: 用户未显式指定，Priority 默认 0
+│   └── watcher.Close() + stopDebounceTimer()
 └── 启动 goroutine 监听事件
     ├── 收到 watcher.Events:
     │   ├── 启动/重置 50ms 防抖定时器
@@ -171,20 +173,241 @@ watchHooks()
     └── 收到 watcher.Errors: 打印红色错误
 ```
 
-#### app.Restart() 的效果
+#### app.Restart() 的完整流程
 
-调用 `app.Restart()` 后：
-1. 当前进程通过 `syscall.Exec`（类 Unix）替换自身为新的进程镜像
-2. 新进程从头执行完整启动流程：
-   - `NewWithConfig()` → `core.NewBaseApp()` → 重新创建所有 Hook 实例
-   - `jsvm.Register()` → `registerHooks()` → 重新扫描 `pb_hooks`、重建 Loader/Executor VM、重新执行所有 JS 文件
-   - `serve` 命令 → `apis.Serve()` → `apis.NewRouter()` → `OnServe.Trigger()` → 重新注册所有路由
-3. 旧进程中已注册到 Hook 上的 JS 回调、VM 池中的 goja.Program、已编译的路由等全部随进程销毁
+[core/base.go#L752-L781](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L752-L781)
 
-**关键结论**：HooksWatch 不做路由卸载、Hook 解绑或 VM 热替换，它依赖操作系统级别的进程重启来达到"热重载"效果。这意味着：
-- Windows 用户必须手动重启进程，无法自动热重载
-- 已建立的 HTTP 连接会被中断
-- Cron 任务会重新调度
+```go
+func (app *BaseApp) Restart() error {
+    // 1. Windows 平台直接拒绝
+    if runtime.GOOS == "windows" {
+        return errors.New("restart is not supported on windows")
+    }
+
+    execPath, _ := os.Executable()
+
+    event := &TerminateEvent{IsRestart: true}
+    event.App = app
+
+    // 2. 触发完整 OnTerminate 钩子链（含优雅关闭 HTTP 服务）
+    return app.OnTerminate().Trigger(event, func(e *TerminateEvent) error {
+        // 3. 清理核心资源
+        _ = e.App.ResetBootstrapState()
+
+        // 4. execve 失败时的回退：尝试重新 Bootstrap
+        defer func() {
+            if err := e.App.Bootstrap(); err != nil {
+                app.Logger().Error("Failed to rebootstrap after failed app.Restart()", "error", err)
+            }
+        }()
+
+        // 5. 调用 execve 替换进程镜像
+        return execve(execPath, os.Args, os.Environ())
+    })
+}
+```
+
+#### OnTerminate 钩子链：按 Priority 排序的完整执行顺序
+
+OnTerminate 是一个普通的 Hook，所有注册的 Handler 按 Priority 从小到大执行。以下是系统内置与 JSVM 插件注册的钩子及其执行顺序：
+
+| Priority | Id | 注册位置 | 职责 |
+|---------|-----|---------|------|
+| **-9999** | `pbGracefulShutdown` | [apis/serve.go#L171-L195](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/apis/serve.go#L171-L195) | **HTTP 优雅关闭**：cancelBaseCtx、server.Shutdown(1s 超时)、重启模式下额外等待 3s |
+| **-999** | `__pbAppLoggerOnTerminate__` | [core/base.go#L1477-L1493](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L1477-L1493) | **日志刷盘**：handler.WriteAll()、ticker.Stop() |
+| **-998** | `__pbNotifyWatcherSystemHook__` | [core/notify_watcher.go#L51-L64](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/notify_watcher.go#L51-L64) | **多实例通知监听器关闭**：关闭 fsnotify.Watcher、删除临时 settings/collections 文件 |
+| **0** *(默认)* | JSVM watcher 清理 | [plugins/jsvm/jsvm.go#L401-L407](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/plugins/jsvm/jsvm.go#L401-L407) | **pb_hooks 监听器关闭**：watcher.Close()、stopDebounceTimer() |
+| 用户自定义 | 用户指定 | — | 用户注册的终止钩子 |
+| finalizer | *(Trigger 的最后一个参数)* | [core/base.go#L769-L780](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L769-L780) | **ResetBootstrapState → execve** |
+
+#### pbGracefulShutdown：HTTP 服务的优雅关闭
+
+[apis/serve.go#L171-L195](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/apis/serve.go#L171-L195) 详细流程：
+
+```
+pbGracefulShutdown handler
+├── cancelBaseCtx()                    // 取消 HTTP Server 的 BaseContext
+│                                      // 所有 SSE 长连接通过这个 context 感知取消
+├── ctx, cancel = WithTimeout(1s)      // Shutdown 最长等待 1 秒
+├── wg.Add(1)                          // WaitGroup +1
+├── server.Shutdown(ctx)               // Go 标准库优雅关闭：
+│                                      //   1. 关闭 Listener，停止接受新连接
+│                                      //   2. 关闭所有 idle 连接
+│                                      //   3. 等待活跃连接处理完毕（或超时）
+│                                      //   4. 超时后强制中断剩余连接
+├── if te.IsRestart:
+│   └── time.AfterFunc(3s, wg.Done)    // 重启模式：最多再等 3 秒让 execve 完成
+└── else:
+    └── wg.Done()                      // 正常终止：立即 Done
+```
+
+**Serve 函数外层的 defer**（见 [apis/serve.go#L198-L204](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/apis/serve.go#L198-L204)）：
+```go
+defer func() {
+    wg.Wait()          // 阻塞直到优雅关闭完成
+    if listener != nil {
+        _ = listener.Close()  // 兜底关闭 Listener
+    }
+}()
+```
+
+**关键修正**：之前文档中"HTTP 连接会被中断"的描述过于简化。实际流程是：
+1. `server.Shutdown()` 先等待最多 **1 秒**让活跃请求处理完毕，超时才强制关闭
+2. 长连接（如 SSE/Realtime）通过 `cancelBaseCtx()` 收到取消信号后主动退出
+3. 重启模式下，还有额外 **3 秒** 等待 execve 完成，期间 HTTP 服务已停止监听但进程仍存活
+4. 最终 execve 替换进程时，所有未完成的连接随旧进程文件描述符被内核释放
+
+#### ResetBootstrapState：核心资源释放
+
+[core/base.go#L449-L480](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L449-L480)
+
+```go
+func (app *BaseApp) ResetBootstrapState() error {
+    app.Cron().Stop()    // ★ 停止 Cron 调度器（含 __pbDBOptimize__ 内置任务）
+
+    // 关闭所有 DB 连接池
+    dbs := []*dbx.Builder{
+        &app.concurrentDB, &app.nonconcurrentDB,
+        &app.auxConcurrentDB, &app.auxNonconcurrentDB,
+    }
+    for _, db := range dbs {
+        if v, ok := (*db).(closer); ok {
+            v.Close()
+        }
+        *db = nil    // 置空指针，标记为未 bootstrapped
+    }
+}
+```
+
+Cron 的启动是在 `registerBaseHooks()` 中通过 OnServe hook（Priority 999）完成的，见 [core/base.go#L1350-L1358](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L1350-L1358)：
+```go
+app.OnServe().Bind(&hook.Handler[*ServeEvent]{
+    Id: "__pbCronStart__",
+    Func: func(e *ServeEvent) error {
+        app.Cron().Start()    // ★ 服务启动时启动 Cron
+        return e.Next()
+    },
+    Priority: 999,  // 最晚执行，确保其他初始化完成
+})
+```
+
+#### execve 的平台特定实现与回退机制
+
+execve 有两个平台变体：
+
+**非 WASM 平台**（[core/syscall.go](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/syscall.go)）：
+```go
+//go:build !(js && wasm)
+func execve(argv0 string, argv []string, envv []string) error {
+    return syscall.Exec(argv0, argv, envv)
+}
+```
+`syscall.Exec` 成功时**永不返回**——当前进程镜像被新的可执行文件完全替换，PID 不变。失败时返回错误。
+
+**WASM 平台**（[core/syscall_wasm.go](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/syscall_wasm.go)）：
+```go
+//go:build js && wasm
+func execve(...) error {
+    return errors.ErrUnsupported    // WASM 不支持进程替换
+}
+```
+
+**execve 失败回退**（[core/base.go#L772-L777](file:///d:/fz/0601/solo-dogfeeding/code/161-pocketbase/core/base.go#L772-L777)）：
+```go
+defer func() {
+    // 仅当 execve 返回了 error（即进程未被替换）时才会执行
+    if err := e.App.Bootstrap(); err != nil {
+        app.Logger().Error("Failed to rebootstrap after failed app.Restart()", "error", err)
+    }
+}()
+```
+
+`Bootstrap()` 内部会先再次调用 `ResetBootstrapState()`（幂等安全），然后重新：
+- 创建数据目录
+- 打开 4 个 DB 连接池（concurrent/nonconcurrent × main/aux）
+- 初始化日志处理器
+- 运行系统迁移
+- 重新加载 Collection 缓存和 Settings
+- 清理临时目录
+
+**注意**：这个回退只能恢复 Core App 级别的状态，无法恢复已经被 `server.Shutdown()` 关闭的 HTTP 服务和 Listener——因为 Serve 函数的 defer 会在 Shutdown 后 `wg.Wait()`，如果 execve 失败，进程最终会从 Serve 返回并退出。
+
+#### 新进程启动后的完整重建
+
+execve 成功后，新进程从头执行标准启动流程，旧进程中所有状态完全清零：
+
+```
+新进程启动
+├── PocketBase.NewWithConfig()
+│   └── core.NewBaseApp()
+│       ├── initHooks()          // 所有 Hook 实例重新创建（全新的 Handler 列表）
+│       └── registerBaseHooks()  // 系统内置钩子重新绑定
+├── jsvm.Register()
+│   ├── registerMigrations()     // 重新扫描 pb_migrations
+│   └── registerHooks()
+│       ├── watchHooks()         // 创建全新的 fsnotify.Watcher
+│       ├── newPool(...)         // 全新的 goja.Runtime 池
+│       ├── 新建 loader VM       // 重新绑定 hooksBinds/routerBinds/cronBinds
+│       └── 遍历 pb_hooks 重新执行所有 JS 文件
+│           └── 所有 routerAdd/routerUse/on*/cronAdd 重新注册
+└── serve 命令 → apis.Serve()
+    ├── Bootstrap()              // 打开 DB、启动 Cron、初始化 notifyWatcher
+    ├── apis.NewRouter()         // 全新 Router + 系统路由
+    ├── OnServe.Trigger()        // 所有 JS 自定义路由重新注入 Router
+    ├── BuildMux()               // 全新 http.ServeMux
+    └── net.Listen + Serve()     // 全新 Listener + HTTP Server
+```
+
+#### 完整终止与重启流程图
+
+```
+pb_hooks 文件变化
+    │
+    ▼
+50ms 防抖定时器
+    │
+    ▼
+p.app.Restart()
+    │
+    ├── Windows → 返回错误，进程不退出
+    │
+    ▼ (非 Windows)
+创建 TerminateEvent{IsRestart: true}
+    │
+    ▼
+OnTerminate.Trigger() 按 Priority 执行
+    │
+    ├─ Priority -9999: pbGracefulShutdown
+    │   ├── cancelBaseCtx()              → SSE/长连接感知取消
+    │   ├── server.Shutdown(1s timeout)  → 关闭 Listener，等待请求完成
+    │   └── 重启模式: AfterFunc(3s, wg.Done)
+    │
+    ├─ Priority -999: __pbAppLoggerOnTerminate__
+    │   ├── handler.WriteAll()           → 批量日志刷盘
+    │   └── ticker.Stop()                → 停止日志定时 flush
+    │
+    ├─ Priority -998: __pbNotifyWatcherSystemHook__
+    │   ├── notifyWatcher.Close()        → 关闭多实例文件监听器
+    │   └── 删除 settings@xxx / collections@xxx 临时文件
+    │
+    ├─ Priority 0: JSVM watcher 清理
+    │   └── fsnotify.Watcher.Close()     → 关闭 pb_hooks 监听器
+    │
+    └── (finalizer) 最后执行
+        ├── ResetBootstrapState()
+        │   ├── Cron().Stop()            → 停止所有定时任务
+        │   └── 关闭 4 个 DB 连接池并置 nil
+        │
+        ├── defer: execve 失败时 Bootstrap()
+        │   └── 重新打开 DB、重启 Cron 等（HTTP 服务无法恢复）
+        │
+        └── execve(execPath, os.Args, os.Environ)
+            ├── 成功 → 永不返回，新进程从头启动
+            └── 失败 → 返回 error → 触发 defer Bootstrap() → Serve 返回 → 进程退出
+
+新进程 (execve 成功)
+    └── 完整启动流程: NewWithConfig → jsvm.Register → Bootstrap → apis.Serve
+```
 
 ---
 
