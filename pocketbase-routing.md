@@ -939,6 +939,155 @@ BuildMux handler 收到 err
 | ErrorHandler 执行 | **跳过**（Written=true） | 执行，写 429 JSON |
 | HTTP 响应状态码 | 200（e.JSON 设置） | 429（ErrorHandler 设置） |
 
+### 7.7 限流 429 错误返回的精确内容核准
+
+以 `POST /api/collections/users/records` 触发限流为例，从错误产生到最终响应和日志的每一步代码追踪：
+
+#### 第一步：checkRateLimit 产生错误
+
+[apis/middlewares_rate_limit.go:184-186](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares_rate_limit.go#L184-L186)
+
+```go
+if !rt.isAllowed(key) {
+    return e.TooManyRequestsError("", errors.New("triggered rate limit rule: "+rule.String()))
+}
+```
+
+传入参数：
+- `message = ""`（空字符串）
+- `rawErrData = errors.New("triggered rate limit rule: " + rule.String())`
+
+其中 `rule.String()` 是 RateLimitRule 的 JSON 序列化（[core/settings_model.go:766-773](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/core/settings_model.go#L766-L773)），典型值如：
+```
+{"label":"users:create","audience":"","duration":60,"maxRequests":60}
+```
+
+#### 第二步：NewTooManyRequestsError → NewApiError 构造 ApiError
+
+[tools/router/error.go:111-131](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/router/error.go#L111-L131)
+
+```go
+func NewTooManyRequestsError(message string, rawErrData any) *ApiError {
+    if message == "" {
+        message = "Too Many Requests."   // 空 message 用默认值
+    }
+    return NewApiError(http.StatusTooManyRequests, message, rawErrData)
+}
+
+func NewApiError(status int, message string, rawErrData any) *ApiError {
+    if message == "" {
+        message = http.StatusText(status)
+    }
+    return &ApiError{
+        rawData: rawErrData,                                    // 保存原始 error，仅用于日志
+        Data:    safeErrorsData(rawErrData),                    // 公开的 data 字段（安全转换）
+        Status:  status,                                        // 429
+        Message: strings.TrimSpace(inflector.Sentenize(message)), // "Too Many Requests."（已有句号，Sentenize 原样返回）
+    }
+}
+```
+
+`safeErrorsData(rawErrData)` 对 `errors.New(...)` 的处理（[tools/router/error.go:151-160](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/router/error.go#L151-L160)）：
+```go
+case error:
+    validationErrors := validation.Errors{}
+    if errors.As(v, &validationErrors) {
+        return resolveSafeErrorsData(validationErrors)
+    }
+    return map[string]any{}  // ← 普通 error 返回空对象（不暴露内部细节）
+```
+
+**构造完成的 ApiError 内存结构**：
+```go
+&ApiError{
+    rawData: errors.New("triggered rate limit rule: {\"label\":\"users:create\",\"audience\":\"\",\"duration\":60,\"maxRequests\":60}"),
+    Data:    map[string]any{},    // 空对象！不向客户端暴露内部错误信息
+    Status:  429,
+    Message: "Too Many Requests.",
+}
+```
+
+#### 第三步：ErrorHandler 写回 HTTP 响应
+
+[tools/router/router.go:160-183](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/tools/router/router.go#L160-L183)
+
+```go
+func ErrorHandler(resp http.ResponseWriter, req *http.Request, err error) {
+    // ...
+    apiErr := ToApiError(err)          // 已是 ApiError，原样返回
+    resp.WriteHeader(apiErr.Status)    // 写 HTTP 429
+    if req.Method != http.MethodHead {
+        json.NewEncoder(resp).Encode(apiErr)  // JSON 编码 ApiError 的导出字段
+    }
+}
+```
+
+**最终 HTTP 响应（完整原始字节）**：
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+X-XSS-Protection: 1; mode=block
+Date: Wed, 10 Jun 2026 10:00:00 GMT
+Content-Length: 59
+
+{"status":429,"message":"Too Many Requests.","data":{}}
+```
+
+关键点：
+- `data` 字段是空对象 `{}`，不向客户端暴露 `triggered rate limit rule: ...` 的内部信息
+- `message` 是 Sentenize 处理后的 `"Too Many Requests."`（首字母大写 + 句号结尾）
+- 安全响应头（X-Content-Type-Options 等）已由 securityHeaders 中间件在 Before 阶段写入
+
+#### 第四步：activityLogger 记录的日志字段
+
+[apis/middlewares.go:394-418](file:///d:/fz/0601/solo-dogfeeding/code/154-pocketbase/apis/middlewares.go#L394-L418)
+
+```go
+if err != nil {
+    apiErr, isPlainApiError := err.(*router.ApiError)
+    if isPlainApiError || errors.As(err, &apiErr) {
+        if status == 0 {                          // Written=false，status 还没写
+            status = apiErr.Status                 // 从 ApiError.Status 读取 = 429
+        }
+        var errMsg string
+        if isPlainApiError {                        // 是直接的 *ApiError（非包装）
+            errMsg = apiErr.Message                  // = "Too Many Requests."
+        } else { ... }
+        attrs = append(attrs,
+            slog.String("error", errMsg),           // "error": "Too Many Requests."
+            slog.Any("details", apiErr.RawData()),   // "details": 原始 error.Error() 字符串
+        )
+    }
+}
+```
+
+**最终写入的日志（slog Error 级别）**：
+
+```
+level=ERROR
+msg="POST /api/collections/users/records"
+type=request
+execTime=1.234
+url=/api/collections/users/records
+method=POST
+status=429
+error="Too Many Requests."
+details="triggered rate limit rule: {\"label\":\"users:create\",\"audience\":\"\",\"duration\":60,\"maxRequests\":60}"
+referer=""
+userAgent="curl/8.0.0"
+auth=""
+userIP="192.168.1.100"
+remoteIP="192.168.1.100"
+```
+
+关键点：
+- 日志的 `error` 字段是公开的 Message（与响应一致）
+- 日志的 `details` 字段包含内部的 `triggered rate limit rule: ...`，用于排查触发了哪条规则
+- 这个 `details` **不会**出现在 HTTP 响应中，只在服务端日志里
+
 ---
 
 ## 8. 完整请求流程示例
